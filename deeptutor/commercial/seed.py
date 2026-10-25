@@ -77,9 +77,10 @@ def build_trial_v1_plan(model_binding: TrialV1ModelBinding) -> PlanSeed:
         "limits.upload_bytes": 26_214_400,
         "limits.concurrent_turns": 1,
         "limits.mineru_max_pages_per_file": 10,
-        # Budget target only. Live provider calls are hard-gated by their
-        # token/page meters until a versioned price catalog can reserve an
-        # attributable platform-cost meter without inventing prices.
+        # Platform-cost budget target: 1 credit = 1000 micros.  Enforced by
+        # the reserve-time budget gate once the platform_cost price catalog
+        # attributes real costs; with no catalog rows everything stays
+        # unpriced at zero and the gate stays open.
         "budget.platform_cost_credits": 2_000,
         "quota.llm_tokens": {"limit": 100_000, "window": "utc_day"},
         "quota.embedding_tokens": {"limit": 500_000, "window": "subscription"},

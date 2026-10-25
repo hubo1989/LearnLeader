@@ -1,9 +1,11 @@
 """Live commercial usage reservations at platform provider boundaries.
 
-This module deliberately records provider usage with ``unpriced-v1`` and zero
-cost.  Phase 2 has no authoritative, versioned price catalog yet, so inventing
-cost attribution here would make the platform-cost budget look enforced when
-it is not.
+Cost attribution happens at finalize time through the versioned price
+catalog (``platform_cost`` ledger): the reservation's meter and the
+customer's model tier resolve to a catalog row, and the event records that
+row's ``price_version`` and computed ``cost_micros``.  With no catalog row
+the event stays ``unpriced-v1`` with zero cost — prices are never invented,
+so the platform-cost budget gate cannot be silently satisfied by fiction.
 """
 
 from __future__ import annotations
@@ -19,12 +21,10 @@ from deeptutor.multi_user.context import get_current_user_or_none
 
 from .entitlement_context import get_commercial_access
 from .errors import CommercialError, EntitlementDenied
-from .models import UsageEvent, UsageReservation
+from .models import UNPRICED_PRICE_VERSION, UsageEvent, UsageReservation
 from .postgres import PostgresCommercialRepository
 from .runtime import CommercialRuntime, get_commercial_runtime
 from .service import CommercialControlPlane
-
-UNPRICED_PRICE_VERSION = "unpriced-v1"
 
 
 class CommercialMeteringError(RuntimeError):
@@ -72,14 +72,12 @@ class CommercialUsageLease:
             if self._state != "active":
                 return None
             try:
-                event = await self.control_plane.finalize_usage(
+                event = await self.control_plane.finalize_metered_usage(
                     self.reservation.id,
                     actual_quantity=max(0, int(actual_quantity)),
                     provider=self.provider,
                     model=self.model,
                     usage_units=usage_units,
-                    price_version=UNPRICED_PRICE_VERSION,
-                    cost_micros=0,
                     is_estimated=is_estimated,
                 )
             except Exception as exc:
@@ -121,14 +119,12 @@ class SyncCommercialUsageLease:
             return None
 
         async def operation(control_plane: CommercialControlPlane) -> UsageEvent:
-            return await control_plane.finalize_usage(
+            return await control_plane.finalize_metered_usage(
                 self.reservation.id,
                 actual_quantity=max(0, int(actual_quantity)),
                 provider=self.provider,
                 model=self.model,
                 usage_units=usage_units,
-                price_version=UNPRICED_PRICE_VERSION,
-                cost_micros=0,
                 is_estimated=is_estimated,
             )
 
