@@ -14,6 +14,7 @@ from .errors import (
     EntitlementDenied,
     IdempotencyConflict,
     ImmutablePlanVersion,
+    ImmutablePriceVersion,
     InvalidOrderTransition,
     InvalidSubscriptionTransition,
     PendingOrderExists,
@@ -23,10 +24,13 @@ from .errors import (
 from .keys import canonical_json
 from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
+    ESTIMATED_USAGE_MIN_EVENTS,
+    ESTIMATED_USAGE_SHARE_THRESHOLD,
     BillingCustomer,
     Entitlement,
     OrderStatus,
     PlanVersion,
+    PriceEntry,
     PurchaseOrder,
     ReconciliationFinding,
     ReconciliationReport,
@@ -55,6 +59,8 @@ class InMemoryCommercialRepository:
         self._plans: dict[str, PlanVersion] = {}
         self._plan_by_key: dict[tuple[str, int], str] = {}
         self._entitlements: dict[str, tuple[Entitlement, ...]] = {}
+        self._prices: dict[str, PriceEntry] = {}
+        self._price_by_row: dict[tuple[str, str, str, str], str] = {}
         self._subscriptions: dict[str, Subscription] = {}
         self._subscription_by_external: dict[tuple[str, str], str] = {}
         self._webhooks: dict[str, WebhookEvent] = {}
@@ -168,6 +174,75 @@ class InMemoryCommercialRepository:
     async def list_entitlements(self, plan_version_id: str) -> tuple[Entitlement, ...]:
         async with self._lock:
             return self._entitlements.get(plan_version_id, ())
+
+    async def publish_price_entries(
+        self,
+        entries: tuple[PriceEntry, ...],
+    ) -> tuple[PriceEntry, ...]:
+        async with self._lock:
+            published: list[PriceEntry] = []
+            for candidate in entries:
+                row_key = (
+                    candidate.price_version,
+                    candidate.kind,
+                    candidate.meter,
+                    candidate.model_tier,
+                )
+                existing_id = self._price_by_row.get(row_key)
+                if existing_id is not None:
+                    existing = self._prices[existing_id]
+                    if not _same_price_entry(existing, candidate):
+                        raise ImmutablePriceVersion(
+                            "price catalog row is immutable; publish a new price_version"
+                        )
+                    published.append(existing)
+                    continue
+                if candidate.id in self._prices:
+                    raise CommercialConflict(f"price entry id already exists: {candidate.id}")
+                self._prices[candidate.id] = candidate
+                self._price_by_row[row_key] = candidate.id
+                published.append(candidate)
+            return tuple(published)
+
+    async def resolve_price(
+        self,
+        kind: str,
+        meter: str,
+        model_tier: str,
+        at: datetime,
+    ) -> PriceEntry | None:
+        async with self._lock:
+            eligible = [
+                entry
+                for entry in self._prices.values()
+                if entry.kind == kind
+                and entry.meter == meter
+                and entry.model_tier == model_tier
+                and entry.effective_from <= at
+            ]
+            if not eligible:
+                return None
+            return max(
+                eligible,
+                key=lambda entry: (entry.effective_from, entry.created_at, entry.price_version),
+            )
+
+    async def list_price_entries(self) -> tuple[PriceEntry, ...]:
+        async with self._lock:
+            return tuple(
+                sorted(
+                    self._prices.values(),
+                    key=lambda entry: (
+                        entry.effective_from,
+                        entry.created_at,
+                        entry.price_version,
+                        entry.kind,
+                        entry.meter,
+                        entry.model_tier,
+                    ),
+                    reverse=True,
+                )
+            )
 
     async def ensure_trial(
         self,
@@ -417,6 +492,9 @@ class InMemoryCommercialRepository:
         self,
         candidate: UsageReservation,
         quota_limit: int | None,
+        *,
+        budget_limit_micros: int | None = None,
+        estimated_cost_micros: int = 0,
     ) -> UsageReservation:
         async with self._lock:
             existing_id = self._reservation_by_dedupe.get(candidate.dedupe_key)
@@ -462,6 +540,23 @@ class InMemoryCommercialRepository:
                     f"quota.{candidate.meter} exceeded: limit={quota_limit}, "
                     f"used={used}, reserved={reserved}, requested={candidate.quantity}"
                 )
+            if budget_limit_micros is not None:
+                # Platform-cost budget: finalized events only.  Held but
+                # unfinalized reservations carry no attributed cost yet;
+                # their meter quota already bounds the missing amounts.
+                spent = sum(
+                    event.cost_micros
+                    for event in self._usage_events.values()
+                    if event.customer_id == candidate.customer_id
+                    and event.subscription_id == candidate.subscription_id
+                )
+                if spent + max(0, estimated_cost_micros) > budget_limit_micros:
+                    raise EntitlementDenied(
+                        "budget.platform_cost exceeded: "
+                        f"limit_micros={budget_limit_micros}, "
+                        f"spent_micros={spent}, "
+                        f"estimated_micros={max(0, estimated_cost_micros)}"
+                    )
             self._reservations[candidate.id] = candidate
             self._reservation_by_dedupe[candidate.dedupe_key] = candidate.id
             return candidate
@@ -648,6 +743,32 @@ class InMemoryCommercialRepository:
                             released_at=at,
                         )
                         repaired += 1
+            totals: dict[tuple[str, str], list[int]] = {}
+            for event in self._usage_events.values():
+                key = (event.customer_id, event.subscription_id)
+                counts = totals.setdefault(key, [0, 0])
+                counts[0] += 1
+                if event.is_estimated:
+                    counts[1] += 1
+            for (customer_id, subscription_id), (total, estimated) in sorted(totals.items()):
+                if (
+                    total < ESTIMATED_USAGE_MIN_EVENTS
+                    or estimated / total <= ESTIMATED_USAGE_SHARE_THRESHOLD
+                ):
+                    continue
+                findings.append(
+                    ReconciliationFinding(
+                        code="estimated_usage_share_high",
+                        entity_type="subscription",
+                        entity_id=subscription_id,
+                        detail=(
+                            f"customer {customer_id}: {estimated}/{total} usage events "
+                            f"are estimated ({estimated / total:.0%}); provider usage "
+                            "reporting looks unhealthy"
+                        ),
+                        repairable=False,
+                    )
+                )
             return ReconciliationReport(
                 checked_at=at,
                 findings=tuple(findings),
@@ -963,6 +1084,28 @@ class InMemoryCommercialRepository:
             raise ActiveSubscriptionExists(
                 "customer already has a trialing, active, or past-due subscription"
             )
+
+
+def _same_price_entry(existing: PriceEntry, candidate: PriceEntry) -> bool:
+    """Semantic identity for replayed catalog rows; ids and timestamps differ."""
+
+    return (
+        existing.price_version,
+        existing.kind,
+        existing.meter,
+        existing.model_tier,
+        existing.unit_price_micros,
+        existing.currency,
+        existing.effective_from,
+    ) == (
+        candidate.price_version,
+        candidate.kind,
+        candidate.meter,
+        candidate.model_tier,
+        candidate.unit_price_micros,
+        candidate.currency,
+        candidate.effective_from,
+    )
 
 
 def _same_usage_event_accounting(existing: UsageEvent, candidate: UsageEvent) -> bool:

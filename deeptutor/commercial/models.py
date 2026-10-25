@@ -62,6 +62,25 @@ class QuotaWindow(str, Enum):
     SUBSCRIPTION = "subscription"
 
 
+class PriceKind(str, Enum):
+    """The two price ledgers sharing one catalog table."""
+
+    PLATFORM_COST = "platform_cost"
+    LIST_PRICE = "list_price"
+
+
+PRICE_KINDS: frozenset[str] = frozenset(kind.value for kind in PriceKind)
+
+#: Tier used when a model is absent or missing from ``pricing.model_tiers``.
+DEFAULT_MODEL_TIER = "default"
+
+#: Recorded on usage events when no catalog row matches; never a real price.
+UNPRICED_PRICE_VERSION = "unpriced-v1"
+
+#: One budget credit equals this many micros of platform cost.
+PLATFORM_COST_CREDIT_MICROS = 1_000
+
+
 ALLOWED_SUBSCRIPTION_TRANSITIONS: Mapping[SubscriptionStatus, frozenset[SubscriptionStatus]] = {
     SubscriptionStatus.TRIALING: frozenset(
         {SubscriptionStatus.EXPIRED, SubscriptionStatus.CANCELED}
@@ -256,6 +275,38 @@ class UsageEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class PriceEntryDraft:
+    """Caller-supplied catalog row; identity fields are filled by the service."""
+
+    meter: str
+    model_tier: str
+    unit_price_micros: int
+    currency: str
+
+
+@dataclass(frozen=True, slots=True)
+class PriceEntry:
+    """One immutable catalog row: unit price for a meter and model tier.
+
+    ``unit_price_micros`` is the cost of a single unit of ``meter`` in
+    micros of ``currency``.  Resolution picks the row with the latest
+    ``effective_from`` at or before the evaluation instant; ties break by
+    ``created_at`` then ``price_version`` (descending) so replays of the
+    same query stay deterministic.
+    """
+
+    id: str
+    price_version: str
+    kind: str
+    meter: str
+    model_tier: str
+    unit_price_micros: int
+    currency: str
+    effective_from: datetime
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class QuotaPolicy:
     limit: int | None
     window: QuotaWindow
@@ -309,6 +360,13 @@ class ReconciliationFinding:
     entity_id: str
     detail: str
     repairable: bool
+
+
+#: Reconcile health-signal thresholds for ``estimated_usage_share_high``:
+#: a subscription period only counts once it has at least this many usage
+#: events, and flags when the estimated share of events exceeds this ratio.
+ESTIMATED_USAGE_SHARE_THRESHOLD = 0.5
+ESTIMATED_USAGE_MIN_EVENTS = 5
 
 
 @dataclass(frozen=True, slots=True)
