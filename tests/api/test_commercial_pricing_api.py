@@ -120,13 +120,44 @@ async def _seed_metered_customer(service: CommercialControlPlane):
         price_minor=4900,
         currency="CNY",
         entitlements={
-            # Daily quotas hold per day; the subscription-period total can
-            # exceed the limit, which is what the preview's overage prices.
-            "quota.llm_tokens": {"limit": 10, "window": "utc_day"},
+            # Subscription-window quota: the preview compares period usage
+            # against this limit. Reservations normally cannot exceed it;
+            # the overage scenarios below plant ledger rows directly to
+            # exercise the defensive pricing path.
+            "quota.llm_tokens": {"limit": 10, "window": "subscription"},
         },
     )
     await service.ensure_trial("cus_me", plan.id)
     return plan
+
+
+def _plant_event(
+    service: CommercialControlPlane, quantity: int, event_id: str, reservation
+) -> None:
+    """Insert a ledger row directly, bypassing the quota enforcement path."""
+
+    from deeptutor.commercial.models import UsageEvent
+
+    service.repository._usage_events[event_id] = UsageEvent(
+        id=event_id,
+        dedupe_key=f"dedupe-{event_id}",
+        reservation_id=reservation.id,
+        customer_id=reservation.customer_id,
+        subscription_id=reservation.subscription_id,
+        meter="llm_tokens",
+        quantity=quantity,
+        provider="openai",
+        model="gpt-test",
+        usage_units={"total_tokens": quantity},
+        price_version="unpriced-v1",
+        cost_micros=0,
+        is_estimated=False,
+        metadata={},
+        period_start=reservation.period_start,
+        period_end=reservation.period_end,
+        occurred_at=reservation.created_at,
+        created_at=reservation.created_at,
+    )
 
 
 def _price_payload(**overrides) -> dict:
@@ -205,7 +236,7 @@ def test_admin_publishes_price_catalog_idempotently(tmp_path, monkeypatch) -> No
 
 
 def test_billing_preview_returns_fixed_plus_priced_overage(tmp_path, monkeypatch) -> None:
-    service, clock = _service()
+    service, _clock = _service()
     runtime = _Runtime(service)
 
     async def scenario() -> None:
@@ -223,17 +254,13 @@ def test_billing_preview_returns_fixed_plus_priced_overage(tmp_path, monkeypatch
                 )
             ],
         )
-        # 10 tokens on day one, 5 more on day two: period total 15 exceeds
-        # the 10/day plan cap by 5, priced at 2 micros each.
-        first = await service.reserve_usage("cus_me", "llm_tokens", 10, "preview-1")
+        # A legal reservation fills the quota; a planted ledger row pushes
+        # the period past it (the defensive path quota normally prevents).
+        reservation = await service.reserve_usage("cus_me", "llm_tokens", 10, "preview-1")
         await service.finalize_metered_usage(
-            first.id, actual_quantity=10, model="gpt-test", is_estimated=False
+            reservation.id, actual_quantity=10, model="gpt-test", is_estimated=False
         )
-        clock.value += timedelta(days=1)
-        second = await service.reserve_usage("cus_me", "llm_tokens", 5, "preview-2")
-        await service.finalize_metered_usage(
-            second.id, actual_quantity=5, model="gpt-test", is_estimated=False
-        )
+        _plant_event(service, 5, "use_over", reservation)
 
         app, _user_ctx = _build_app(monkeypatch, tmp_path, runtime=runtime)
         async with httpx.AsyncClient(
@@ -251,20 +278,16 @@ def test_billing_preview_returns_fixed_plus_priced_overage(tmp_path, monkeypatch
 
 
 def test_billing_preview_marks_unpriced_overage(tmp_path, monkeypatch) -> None:
-    service, clock = _service()
+    service, _clock = _service()
     runtime = _Runtime(service)
 
     async def scenario() -> None:
         await _seed_metered_customer(service)
-        first = await service.reserve_usage("cus_me", "llm_tokens", 10, "unpriced-1")
+        reservation = await service.reserve_usage("cus_me", "llm_tokens", 10, "unpriced-1")
         await service.finalize_metered_usage(
-            first.id, actual_quantity=10, model="gpt-test", is_estimated=False
+            reservation.id, actual_quantity=10, model="gpt-test", is_estimated=False
         )
-        clock.value += timedelta(days=1)
-        second = await service.reserve_usage("cus_me", "llm_tokens", 2, "unpriced-2")
-        await service.finalize_metered_usage(
-            second.id, actual_quantity=2, model="gpt-test", is_estimated=False
-        )
+        _plant_event(service, 2, "use_over", reservation)
 
         app, _user_ctx = _build_app(monkeypatch, tmp_path, runtime=runtime)
         async with httpx.AsyncClient(

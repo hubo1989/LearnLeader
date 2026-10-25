@@ -174,10 +174,16 @@ class CommercialControlPlane:
         attribution), ``list_price`` prices what it is sold for (billing
         preview).  Republishing an existing (price_version, kind, meter,
         model_tier) row with different content is rejected; price changes
-        require a new ``price_version``.
+        require a new ``price_version``.  The reserved ``unpriced-v1``
+        sentinel is rejected as a version name, and the whole
+        ``platform_cost`` ledger must stay single-currency — budget
+        accounting sums raw micros, so a second currency would compare
+        unrelated amounts.
         """
 
         clean_version = _required(price_version, "price_version")
+        if clean_version == UNPRICED_PRICE_VERSION:
+            raise ValueError(f"{UNPRICED_PRICE_VERSION} is reserved for unpriced events")
         clean_kind = _required(kind, "kind").lower()
         if clean_kind not in PRICE_KINDS:
             raise ValueError("kind must be platform_cost or list_price")
@@ -216,6 +222,12 @@ class CommercialControlPlane:
                     created_at=now,
                 )
             )
+        if clean_kind == PriceKind.PLATFORM_COST.value:
+            existing = await self.repository.list_price_entries()
+            currencies = {entry.currency for entry in existing if entry.kind == clean_kind}
+            currencies.update(row.currency for row in rows)
+            if len(currencies) > 1:
+                raise ValueError("platform_cost catalog rows must share a single currency")
         return await self.repository.publish_price_entries(tuple(rows))
 
     async def list_price_entries(
@@ -488,15 +500,17 @@ class CommercialControlPlane:
         estimated_cost_micros = 0
         if budget_limit_micros is not None:
             model = metadata_value.get("model")
-            catalog_entry = await self._resolve_catalog_price(
-                kind=PriceKind.PLATFORM_COST.value,
-                meter=clean_meter,
-                model=model if isinstance(model, str) else None,
-                customer_id=clean_customer_id,
-                at=now,
+            catalog_entry = await self.repository.resolve_price(
+                PriceKind.PLATFORM_COST.value,
+                clean_meter,
+                _resolve_model_tier(resolved.values, model if isinstance(model, str) else None),
+                now,
             )
             if catalog_entry is not None:
                 estimated_cost_micros = catalog_entry.unit_price_micros * quantity
+                # Snapshot the estimate on the reservation so the budget
+                # gate can also count in-flight reservations atomically.
+                metadata_value["estimated_cost_micros"] = estimated_cost_micros
         period_start, period_end = _quota_period(
             quota_policy.window,
             now,
@@ -678,14 +692,17 @@ class CommercialControlPlane:
         }
 
     async def billing_preview(self, customer_id: str) -> dict[str, Any]:
-        """Read-only cost estimate for the caller's current subscription period.
+        """Read-only cost estimate for the caller's current billing position.
 
         The fixed charge snapshots the subscription's immutable plan-version
-        price.  Overage is usage beyond each quota's plan limit inside this
-        subscription period, estimated with the ``list_price`` catalog and
-        split across model tiers proportionally to each tier's share of the
-        metered quantity (the final tier absorbs integer rounding so the
-        split sums exactly to the excess).  Catalog misses surface as
+        price for the subscription period.  Overage is usage beyond each
+        quota's plan limit **inside that quota's enforcement window** —
+        today for ``utc_day`` meters, the subscription period otherwise —
+        mirroring the window ``reserve_usage`` enforces, so filling a daily
+        quota every day never reads as period overage.  Overage units
+        consume the limit oldest-event-first and price at the ``list_price``
+        catalog row effective when each event occurred, so publishing a new
+        catalog row never reprices history.  Catalog misses surface as
         ``unpriced: true`` rows instead of a guessed price.  Nothing is
         written; this is a derived read model, never a billing source of
         truth.  ``totals.overage_micros`` is ``null`` when priced rows carry
@@ -725,71 +742,74 @@ class CommercialControlPlane:
                 policy = resolved.quota(meter)
             except (KeyError, ValueError):
                 continue
-            used_by_tier: dict[str, int] = {}
-            for event in events:
-                if event.meter != meter:
-                    continue
-                tier = _resolve_model_tier(resolved.values, event.model)
-                used_by_tier[tier] = used_by_tier.get(tier, 0) + int(event.quantity)
-            used = sum(used_by_tier.values())
-            excess = max(0, used - policy.limit) if policy.limit is not None else 0
+            # Each quota is evaluated in its own enforcement window (today
+            # for utc_day meters, the subscription period otherwise) — the
+            # same window reserve_usage enforces, so a customer who fills a
+            # daily quota every day is never reported as period overage.
+            window_start, window_end = _quota_period(policy.window, at, period_start, period_end)
+            meter_events = sorted(
+                (
+                    event
+                    for event in events
+                    if event.meter == meter and window_start <= event.occurred_at < window_end
+                ),
+                key=lambda event: (event.occurred_at, event.id),
+            )
+            used = sum(int(event.quantity) for event in meter_events)
             usage_rows.append(
                 {
                     "meter": meter,
                     "limit": policy.limit,
                     "window": policy.window.value,
+                    "window_start": window_start.isoformat(),
+                    "window_end": window_end.isoformat(),
                     "used": used,
-                    "excess": excess,
+                    "excess": max(0, used - policy.limit) if policy.limit is not None else 0,
                 }
             )
-            if excess <= 0:
+            if policy.limit is None:
                 continue
-            total = used or 1
-            allocated = 0
-            tiers = sorted(used_by_tier)
-            for index, tier in enumerate(tiers):
-                if index == len(tiers) - 1:
-                    tier_excess = excess - allocated
-                else:
-                    tier_excess = excess * used_by_tier[tier] // total
-                    allocated += tier_excess
-                if tier_excess <= 0:
+            # Consume the limit oldest-event-first and price each overage
+            # unit at the catalog row effective when that event occurred, so
+            # publishing a new catalog row never reprices history.
+            remaining = policy.limit
+            buckets: dict[tuple[str, str | None], dict[str, Any]] = {}
+            for event in meter_events:
+                free = min(int(event.quantity), max(remaining, 0))
+                remaining -= free
+                chargeable = int(event.quantity) - free
+                if chargeable <= 0:
                     continue
+                tier = _resolve_model_tier(resolved.values, event.model)
                 entry = await self.repository.resolve_price(
                     PriceKind.LIST_PRICE.value,
                     meter,
                     tier,
-                    at,
+                    event.occurred_at,
                 )
-                if entry is None:
-                    overage_rows.append(
-                        {
-                            "meter": meter,
-                            "model_tier": tier,
-                            "quantity": tier_excess,
-                            "unit_price_micros": None,
-                            "cost_micros": 0,
-                            "currency": None,
-                            "unpriced": True,
-                        }
-                    )
-                    if meter not in unpriced_meters:
-                        unpriced_meters.append(meter)
-                    continue
-                cost_micros = entry.unit_price_micros * tier_excess
-                overage_total_micros += cost_micros
-                priced_currencies.add(entry.currency)
-                overage_rows.append(
-                    {
+                bucket_key = (tier, entry.id if entry is not None else None)
+                bucket = buckets.get(bucket_key)
+                if bucket is None:
+                    bucket = {
                         "meter": meter,
                         "model_tier": tier,
-                        "quantity": tier_excess,
-                        "unit_price_micros": entry.unit_price_micros,
-                        "cost_micros": cost_micros,
-                        "currency": entry.currency,
-                        "unpriced": False,
+                        "quantity": 0,
+                        "unit_price_micros": entry.unit_price_micros if entry else None,
+                        "cost_micros": 0,
+                        "currency": entry.currency if entry else None,
+                        "unpriced": entry is None,
                     }
-                )
+                    buckets[bucket_key] = bucket
+                    overage_rows.append(bucket)
+                    if entry is None and meter not in unpriced_meters:
+                        unpriced_meters.append(meter)
+                bucket["quantity"] += chargeable
+                if entry is not None:
+                    bucket["cost_micros"] += entry.unit_price_micros * chargeable
+        for row in overage_rows:
+            if not row["unpriced"]:
+                overage_total_micros += row["cost_micros"]
+                priced_currencies.add(row["currency"])
         currency_mismatch = bool(priced_currencies) and priced_currencies != {plan.currency}
         single_currency = next(iter(priced_currencies)) if len(priced_currencies) == 1 else None
         return {
@@ -824,7 +844,14 @@ class CommercialControlPlane:
         price_version: str = "unpriced",
         cost_micros: int = 0,
         is_estimated: bool = True,
+        reservation: UsageReservation | None = None,
     ) -> UsageEvent:
+        """Commit final usage; ``reservation`` may preload the row to reuse.
+
+        Callers that already fetched the reservation (for example to derive
+        pricing) pass it here so the reservation is read once per finalize.
+        """
+
         if (
             isinstance(actual_quantity, bool)
             or not isinstance(actual_quantity, int)
@@ -836,11 +863,13 @@ class CommercialControlPlane:
         if not isinstance(is_estimated, bool):
             raise ValueError("is_estimated must be a boolean")
         clean_price_version = _required(price_version, "price_version")
-        reservation = await self.repository.get_usage_reservation(
-            _required(reservation_id, "reservation_id")
-        )
+        clean_reservation_id = _required(reservation_id, "reservation_id")
         if reservation is None:
-            raise CommercialNotFound(f"usage reservation not found: {reservation_id}")
+            reservation = await self.repository.get_usage_reservation(clean_reservation_id)
+        elif reservation.id != clean_reservation_id:
+            raise ValueError("preloaded reservation does not match reservation_id")
+        if reservation is None:
+            raise CommercialNotFound(f"usage reservation not found: {clean_reservation_id}")
         units = dict(usage_units or {reservation.meter: actual_quantity})
         for unit, value in units.items():
             _required(str(unit), "usage unit")
@@ -887,9 +916,13 @@ class CommercialControlPlane:
     ) -> UsageEvent:
         """Finalize a reservation with catalog pricing (``platform_cost``).
 
-        Cost attribution resolves the customer's ``pricing.model_tiers``
-        mapping (default tier ``default``) and looks up the platform-cost
-        catalog row effective at the event instant.  With no matching row
+        Tier and price are snapshotted to the reservation: the model tier
+        comes from the ``pricing.model_tiers`` mapping of the plan the
+        reserved subscription belongs to (not whatever subscription is
+        current at finalize time), and the catalog row is the one effective
+        when the reservation was created — a stable instant, so a retry
+        after the response was lost resolves the same immutable row instead
+        of conflicting with the recorded attribution.  With no matching row
         the event stays ``unpriced-v1`` with zero cost — prices are never
         invented, so the platform-cost budget stays honest until a catalog
         row exists.
@@ -899,13 +932,20 @@ class CommercialControlPlane:
         reservation = await self.repository.get_usage_reservation(clean_reservation_id)
         if reservation is None:
             raise CommercialNotFound(f"usage reservation not found: {clean_reservation_id}")
-        occurred_at = self._now()
-        catalog_entry = await self._resolve_catalog_price(
-            kind=PriceKind.PLATFORM_COST.value,
-            meter=reservation.meter,
-            model=model,
-            customer_id=reservation.customer_id,
-            at=occurred_at,
+        subscription = await self.repository.get_subscription(reservation.subscription_id)
+        if subscription is None:
+            raise CommercialConflict(
+                f"usage reservation references a missing subscription: "
+                f"{reservation.subscription_id}"
+            )
+        entitlements = await self.repository.list_entitlements(subscription.plan_version_id)
+        plan_values = {item.key: thaw_json(item.value) for item in entitlements}
+        tier = _resolve_model_tier(plan_values, model)
+        catalog_entry = await self.repository.resolve_price(
+            PriceKind.PLATFORM_COST.value,
+            reservation.meter,
+            tier,
+            reservation.created_at,
         )
         if catalog_entry is None:
             price_version, cost_micros = UNPRICED_PRICE_VERSION, 0
@@ -921,6 +961,7 @@ class CommercialControlPlane:
             price_version=price_version,
             cost_micros=cost_micros,
             is_estimated=is_estimated,
+            reservation=reservation,
         )
 
     async def release_usage(self, reservation_id: str) -> UsageReservation:
@@ -1185,26 +1226,6 @@ class CommercialControlPlane:
                 f"resolved subscription disappeared during reservation: {subscription_id}"
             )
         return subscription
-
-    async def _resolve_catalog_price(
-        self,
-        *,
-        kind: str,
-        meter: str,
-        model: str | None,
-        customer_id: str,
-        at: datetime,
-    ) -> PriceEntry | None:
-        """Resolve the catalog row for a model via the customer's tier map.
-
-        A missing or malformed ``pricing.model_tiers`` mapping falls back to
-        the ``default`` tier rather than blocking metering: an unpriced
-        event (cost zero) is recoverable, a dropped usage event is not.
-        """
-
-        resolved = await self.resolve_entitlements(customer_id, at=at)
-        tier = _resolve_model_tier(resolved.values, model)
-        return await self.repository.resolve_price(kind, meter, tier, at)
 
 
 def _resolve_model_tier(values: Mapping[str, Any], model: str | None) -> str:

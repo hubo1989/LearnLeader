@@ -320,21 +320,30 @@ async def test_budget_gate_converts_credits_and_skips_old_plans(commercial_harne
         await service.reserve_usage(bad_customer.id, "llm_tokens", 5, "bad-1")
 
 
-async def test_billing_preview_splits_overage_across_tiers(commercial_harness):
+async def test_billing_preview_prices_overage_at_event_time_by_tier(commercial_harness):
+    """Overage consumes the limit oldest-first and prices per event instant.
+
+    The quota system normally prevents usage beyond a window's limit, so
+    this scenario plants ledger rows directly — the defensive pricing path
+    for inconsistent history or future gateway-fed meters.
+    """
+
+    from deeptutor.commercial.models import UsageEvent
+
     service, repository, clock = commercial_harness
-    del repository
     customer, plan = await _metered_customer(
         service,
         owner="user-preview",
-        token_limit=100,
-        token_window="utc_day",
+        token_limit=10,
+        token_window="subscription",
         price_minor=4_900,
         extra={"pricing.model_tiers": {"gpt-premium": "premium"}},
     )
+    t0 = clock.value
     await service.publish_price_version(
-        price_version="list-2026-10",
+        price_version="list-v1",
         kind="list_price",
-        effective_from=service._now() - timedelta(days=1),
+        effective_from=t0 - timedelta(days=2),
         entries=[
             PriceEntryDraft(
                 meter="llm_tokens", model_tier="default", unit_price_micros=2, currency="CNY"
@@ -344,46 +353,100 @@ async def test_billing_preview_splits_overage_across_tiers(commercial_harness):
             ),
         ],
     )
+    # A later catalog version reprices only events after its effective_from.
+    await service.publish_price_version(
+        price_version="list-v2",
+        kind="list_price",
+        effective_from=t0 + timedelta(minutes=30),
+        entries=[
+            PriceEntryDraft(
+                meter="llm_tokens", model_tier="default", unit_price_micros=5, currency="CNY"
+            )
+        ],
+    )
 
-    # Day one fills 60 default tokens; day two adds 60 premium tokens.
-    # Daily quotas hold, but the subscription period totals 120 > 100.
-    await _reserve_and_finalize(
-        service, customer.id, quantity=60, request_id="preview-1", model="gpt-test"
-    )
-    clock.value += timedelta(days=1)
-    await _reserve_and_finalize(
-        service, customer.id, quantity=60, request_id="preview-2", model="gpt-premium"
-    )
-    # parse_pages: 5 + 5 across two days exceeds its 8/day-plan cap in the
-    # period and has no list_price row at all -> unpriced overage.
-    await _reserve_and_finalize(
-        service, customer.id, meter="parse_pages", quantity=5, request_id="preview-3"
-    )
-    clock.value += timedelta(days=1)
-    await _reserve_and_finalize(
-        service, customer.id, meter="parse_pages", quantity=5, request_id="preview-4"
+    subscription = await service.repository.get_entitled_subscription(customer.id, t0)
+    assert subscription is not None
+
+    def _event(name: str, quantity: int, model: str, minutes: int) -> None:
+        occurred = t0 + timedelta(minutes=minutes)
+        repository._usage_events[f"use_{name}"] = UsageEvent(
+            id=f"use_{name}",
+            dedupe_key=f"dedupe-{name}",
+            reservation_id=f"res_{name}",
+            customer_id=customer.id,
+            subscription_id=subscription.id,
+            meter="llm_tokens",
+            quantity=quantity,
+            provider="openai",
+            model=model,
+            usage_units={"total_tokens": quantity},
+            price_version="unpriced-v1",
+            cost_micros=0,
+            is_estimated=False,
+            metadata={},
+            period_start=subscription.current_period_start,
+            period_end=subscription.current_period_end,
+            occurred_at=occurred,
+            created_at=occurred,
+        )
+
+    # Limit 10, oldest-first: 6 free + 4 free, then 2 default overage before
+    # the v2 cutoff (priced 2), 4 premium overage after it (still v1 premium
+    # at 10 — v2 only repriced default), and 3 more default units after the
+    # cutoff priced at the new 5.
+    _event("a", 6, "gpt-test", 10)
+    _event("b", 6, "gpt-test", 20)  # 4 free + 2 overage at list-v1
+    _event("c", 4, "gpt-premium", 40)  # all overage at list-v1 premium
+    _event("d", 3, "gpt-test", 50)  # all overage at list-v2 default
+    # parse_pages overage with no list_price row at all -> unpriced.
+    repository._usage_events["use_pages"] = UsageEvent(
+        id="use_pages",
+        dedupe_key="dedupe-pages",
+        reservation_id="res_pages",
+        customer_id=customer.id,
+        subscription_id=subscription.id,
+        meter="parse_pages",
+        quantity=9,
+        provider="mineru",
+        model=None,
+        usage_units={"pages": 9},
+        price_version="unpriced-v1",
+        cost_micros=0,
+        is_estimated=False,
+        metadata={},
+        period_start=subscription.current_period_start,
+        period_end=subscription.current_period_end,
+        occurred_at=t0,
+        created_at=t0,
     )
 
     preview = await service.billing_preview(customer.id)
     assert preview["fixed"] == {"price_minor": 4_900, "currency": "CNY"}
     usage_by_meter = {row["meter"]: row for row in preview["usage"]}
-    assert usage_by_meter["llm_tokens"]["used"] == 120
-    assert usage_by_meter["llm_tokens"]["excess"] == 20
-    assert usage_by_meter["parse_pages"]["excess"] == 2
+    assert usage_by_meter["llm_tokens"]["used"] == 19
+    assert usage_by_meter["llm_tokens"]["excess"] == 9
+    assert usage_by_meter["llm_tokens"]["window"] == "subscription"
+    assert usage_by_meter["parse_pages"]["excess"] == 1
 
-    overage_by_key = {(row["meter"], row["model_tier"]): row for row in preview["overage"]}
-    llm_default = overage_by_key[("llm_tokens", "default")]
-    llm_premium = overage_by_key[("llm_tokens", "premium")]
-    pages_row = overage_by_key[("parse_pages", "default")]
-    assert llm_default["quantity"] == 10 and llm_default["cost_micros"] == 20
-    assert llm_premium["quantity"] == 10 and llm_premium["cost_micros"] == 100
-    assert llm_default["unpriced"] is False and llm_premium["unpriced"] is False
+    overage_by_key = {
+        (row["meter"], row["model_tier"], row["unit_price_micros"]): row
+        for row in preview["overage"]
+    }
+    llm_v1 = overage_by_key[("llm_tokens", "default", 2)]
+    llm_v2 = overage_by_key[("llm_tokens", "default", 5)]
+    llm_premium = overage_by_key[("llm_tokens", "premium", 10)]
+    pages_row = overage_by_key[("parse_pages", "default", None)]
+    assert llm_v1["quantity"] == 2 and llm_v1["cost_micros"] == 4
+    assert llm_v2["quantity"] == 3 and llm_v2["cost_micros"] == 15
+    assert llm_premium["quantity"] == 4 and llm_premium["cost_micros"] == 40
+    assert all(row["unpriced"] is False for row in (llm_v1, llm_v2, llm_premium))
     assert pages_row["unpriced"] is True
     assert pages_row["cost_micros"] == 0
 
     totals = preview["totals"]
     assert totals["fixed_minor"] == 4_900
-    assert totals["overage_micros"] == 120
+    assert totals["overage_micros"] == 4 + 15 + 40
     assert totals["overage_currency"] == "CNY"
     assert totals["currency_mismatch"] is False
     assert totals["unpriced_meters"] == ["parse_pages"]
@@ -392,6 +455,45 @@ async def test_billing_preview_splits_overage_across_tiers(commercial_harness):
     stranger = await service.ensure_billing_customer(owner_id="user-stranger")
     with pytest.raises(CommercialNotFound):
         await service.billing_preview(stranger.id)
+
+
+async def test_billing_preview_never_flags_compliant_daily_usage(commercial_harness):
+    """Filling a daily quota every day is not period overage."""
+
+    service, repository, clock = commercial_harness
+    del repository
+    customer, plan = await _metered_customer(
+        service,
+        owner="user-compliant",
+        token_limit=100,
+        token_window="utc_day",
+        price_minor=4_900,
+    )
+    await service.publish_price_version(
+        price_version="list-2026-10",
+        kind="list_price",
+        effective_from=clock.value - timedelta(days=1),
+        entries=[
+            PriceEntryDraft(
+                meter="llm_tokens", model_tier="default", unit_price_micros=2, currency="CNY"
+            )
+        ],
+    )
+    # Three days, each exactly at the daily cap.
+    for day in range(3):
+        await _reserve_and_finalize(
+            service, customer.id, quantity=100, request_id=f"full-{day}", model="gpt-test"
+        )
+        clock.value += timedelta(days=1)
+
+    preview = await service.billing_preview(customer.id)
+    usage_by_meter = {row["meter"]: row for row in preview["usage"]}
+    # The preview evaluates the current (today's) window, not the period.
+    assert usage_by_meter["llm_tokens"]["used"] == 0
+    assert usage_by_meter["llm_tokens"]["excess"] == 0
+    assert preview["overage"] == []
+    assert preview["totals"]["overage_micros"] == 0
+    assert preview["totals"]["unpriced_meters"] == []
 
 
 async def test_billing_preview_without_overage_has_no_list_rows(commercial_harness):
@@ -492,3 +594,214 @@ async def test_publish_price_version_rejects_naive_effective_from(commercial_har
                 )
             ],
         )
+
+
+async def test_overlapping_reservations_share_the_budget(commercial_harness):
+    """In-flight reservations count their snapshotted estimate, not zero."""
+
+    service, repository, clock = commercial_harness
+    del repository, clock
+    customer, plan = await _metered_customer(
+        service, token_limit=10_000, extra={"budget.platform_cost_micros": 300}
+    )
+    await _publish_platform_catalog(service)  # default tier: 3 micros/token
+
+    # 100 tokens estimate exactly 300 micros: reserved but not finalized.
+    held = await service.reserve_usage(customer.id, "llm_tokens", 100, "shared-1")
+    assert held.metadata["estimated_cost_micros"] == 300
+
+    # A second priced call must see the first reservation's estimate.
+    with pytest.raises(EntitlementDenied, match="budget.platform_cost exceeded"):
+        await service.reserve_usage(customer.id, "llm_tokens", 1, "shared-2")
+
+    # Unpriced meters are still free to reserve while it is held.
+    other = await service.reserve_usage(customer.id, "parse_pages", 5, "shared-3")
+    assert other.meter == "parse_pages"
+
+
+async def test_publish_rejects_sentinel_version_and_second_platform_currency(
+    commercial_harness,
+):
+    service, repository, clock = commercial_harness
+    del repository, clock
+    await _publish_platform_catalog(service)  # platform_cost in CNY
+
+    from deeptutor.commercial.models import UNPRICED_PRICE_VERSION
+
+    with pytest.raises(ValueError, match="reserved for unpriced events"):
+        await service.publish_price_version(
+            price_version=UNPRICED_PRICE_VERSION,
+            kind="list_price",
+            effective_from=service._now(),
+            entries=[
+                PriceEntryDraft(
+                    meter="llm_tokens", model_tier="default", unit_price_micros=1, currency="CNY"
+                )
+            ],
+        )
+
+    # A second platform_cost currency would sum unrelated micros.
+    with pytest.raises(ValueError, match="single currency"):
+        await service.publish_price_version(
+            price_version="prices-usd",
+            kind="platform_cost",
+            effective_from=service._now(),
+            entries=[
+                PriceEntryDraft(
+                    meter="llm_tokens", model_tier="default", unit_price_micros=1, currency="USD"
+                )
+            ],
+        )
+
+    # list_price keeps its mixed-currency tolerance (preview flags it).
+    await service.publish_price_version(
+        price_version="list-usd",
+        kind="list_price",
+        effective_from=service._now(),
+        entries=[
+            PriceEntryDraft(
+                meter="llm_tokens", model_tier="default", unit_price_micros=1, currency="USD"
+            )
+        ],
+    )
+    entries = await service.list_price_entries(kind="list_price")
+    assert {entry.currency for entry in entries} == {"USD"}
+
+
+async def test_finalize_prices_with_the_reserved_plans_tier_mapping(commercial_harness):
+    """A late finalize keeps the reserved plan's tiers, not the new plan's."""
+
+    service, repository, clock = commercial_harness
+    del repository
+    await _publish_platform_catalog(service)
+    customer, plain_plan = await _metered_customer(service, owner="user-switch")
+    reservation = await service.reserve_usage(customer.id, "llm_tokens", 10, "switch-1")
+
+    # Replace effective access with a plan mapping the model to premium.
+    premium_plan = await service.publish_plan_version(
+        plan_code="premium-mapped",
+        version=1,
+        name="Premium mapped",
+        price_minor=0,
+        currency="CNY",
+        entitlements={
+            "quota.llm_tokens": {"limit": 1_000, "window": "subscription"},
+            "pricing.model_tiers": {"gpt-test": "premium"},
+        },
+    )
+    await service.activate_paid_subscription(
+        customer.id,
+        premium_plan.id,
+        provider="manual",
+        external_subscription_id="ext-switch-1",
+        current_period_start=clock.value,
+        current_period_end=clock.value + timedelta(days=30),
+    )
+
+    event = await service.finalize_metered_usage(
+        reservation.id, actual_quantity=10, model="gpt-test", is_estimated=False
+    )
+    # The reservation belongs to the plain plan: default tier at 3 micros,
+    # never the replacement plan's premium tier at 9.
+    assert event.cost_micros == 3 * 10
+    del plain_plan
+
+
+async def test_finalize_retry_after_catalog_update_keeps_recorded_price(commercial_harness):
+    """Retries resolve the reservation-time instant, so attribution is stable."""
+
+    service, repository, clock = commercial_harness
+    del repository
+    customer, plan = await _metered_customer(service, token_limit=1_000)
+    await _publish_platform_catalog(service)  # default tier at 3 micros
+    reservation = await service.reserve_usage(customer.id, "llm_tokens", 10, "retry-1")
+
+    # A repriced catalog becomes effective after the reservation exists.
+    clock.value += timedelta(minutes=5)
+    await service.publish_price_version(
+        price_version="prices-raised",
+        kind="platform_cost",
+        effective_from=clock.value,
+        entries=[
+            PriceEntryDraft(
+                meter="llm_tokens", model_tier="default", unit_price_micros=50, currency="CNY"
+            )
+        ],
+    )
+
+    event = await service.finalize_metered_usage(
+        reservation.id, actual_quantity=10, model="gpt-test", is_estimated=False
+    )
+    assert event.price_version == "prices-2026-10"
+    assert event.cost_micros == 3 * 10
+
+    # A retried finalize converges on the same event instead of conflicting.
+    replay = await service.finalize_metered_usage(
+        reservation.id, actual_quantity=10, model="gpt-test", is_estimated=False
+    )
+    assert replay.id == event.id
+    assert replay.cost_micros == event.cost_micros
+
+
+async def test_memory_batch_publish_is_atomic_and_consistently_ordered(commercial_harness):
+    """A rejected row cannot leave earlier rows of the batch published."""
+
+    from deeptutor.commercial.models import PriceEntry
+
+    service, repository, clock = commercial_harness
+    del clock
+    published = await _publish_platform_catalog(service)
+    original = published[0]
+    now = service._now()
+
+    # Batch via the repository interface: a fresh row first, then a drifted
+    # replay of an already-published row. The whole batch fails and the
+    # fresh row must not remain published (Postgres rolls back the same way).
+    fresh = PriceEntry(
+        id="price_fresh",
+        price_version="prices-batch",
+        kind="platform_cost",
+        meter="fresh_meter",
+        model_tier="default",
+        unit_price_micros=1,
+        currency="CNY",
+        effective_from=now,
+        created_at=now,
+    )
+    drifted = PriceEntry(
+        id="price_drift",
+        price_version=original.price_version,
+        kind=original.kind,
+        meter=original.meter,
+        model_tier=original.model_tier,
+        unit_price_micros=99,
+        currency=original.currency,
+        effective_from=original.effective_from,
+        created_at=now,
+    )
+    with pytest.raises(ImmutablePriceVersion):
+        await repository.publish_price_entries((fresh, drifted))
+    assert await repository.resolve_price("platform_cost", "fresh_meter", "default", now) is None
+
+    # Listing matches the Postgres ordering: temporal keys descending, then
+    # kind/meter/model_tier ascending.
+    await service.publish_price_version(
+        price_version="prices-older",
+        kind="platform_cost",
+        effective_from=now - timedelta(days=5),
+        entries=[
+            PriceEntryDraft(
+                meter="zz_meter", model_tier="default", unit_price_micros=1, currency="CNY"
+            ),
+            PriceEntryDraft(
+                meter="aa_meter", model_tier="default", unit_price_micros=1, currency="CNY"
+            ),
+        ],
+    )
+    listed = await repository.list_price_entries()
+    temporal = [(entry.effective_from, entry.created_at, entry.price_version) for entry in listed]
+    assert temporal == sorted(temporal, reverse=True)
+    newest = [entry for entry in listed if entry.price_version == "prices-2026-10"]
+    assert [entry.model_tier for entry in newest] == ["default", "premium"]
+    oldest = [entry for entry in listed if entry.price_version == "prices-older"]
+    assert [entry.meter for entry in oldest] == ["aa_meter", "zz_meter"]

@@ -180,7 +180,11 @@ class InMemoryCommercialRepository:
         entries: tuple[PriceEntry, ...],
     ) -> tuple[PriceEntry, ...]:
         async with self._lock:
+            # Validate the whole batch before mutating any state, matching
+            # the Postgres transaction: a rejected row can never leave
+            # earlier rows of the same batch published.
             published: list[PriceEntry] = []
+            pending: list[PriceEntry] = []
             for candidate in entries:
                 row_key = (
                     candidate.price_version,
@@ -199,9 +203,18 @@ class InMemoryCommercialRepository:
                     continue
                 if candidate.id in self._prices:
                     raise CommercialConflict(f"price entry id already exists: {candidate.id}")
-                self._prices[candidate.id] = candidate
-                self._price_by_row[row_key] = candidate.id
                 published.append(candidate)
+                pending.append(candidate)
+            for candidate in pending:
+                self._prices[candidate.id] = candidate
+                self._price_by_row[
+                    (
+                        candidate.price_version,
+                        candidate.kind,
+                        candidate.meter,
+                        candidate.model_tier,
+                    )
+                ] = candidate.id
             return tuple(published)
 
     async def resolve_price(
@@ -229,17 +242,16 @@ class InMemoryCommercialRepository:
 
     async def list_price_entries(self) -> tuple[PriceEntry, ...]:
         async with self._lock:
+            # Match the Postgres ORDER BY: the temporal keys descending,
+            # then kind/meter/model_tier ascending (stable two-pass sort).
+            rows = sorted(
+                self._prices.values(),
+                key=lambda entry: (entry.kind, entry.meter, entry.model_tier),
+            )
             return tuple(
                 sorted(
-                    self._prices.values(),
-                    key=lambda entry: (
-                        entry.effective_from,
-                        entry.created_at,
-                        entry.price_version,
-                        entry.kind,
-                        entry.meter,
-                        entry.model_tier,
-                    ),
+                    rows,
+                    key=lambda entry: (entry.effective_from, entry.created_at, entry.price_version),
                     reverse=True,
                 )
             )
@@ -541,21 +553,31 @@ class InMemoryCommercialRepository:
                     f"used={used}, reserved={reserved}, requested={candidate.quantity}"
                 )
             if budget_limit_micros is not None:
-                # Platform-cost budget: finalized events only.  Held but
-                # unfinalized reservations carry no attributed cost yet;
-                # their meter quota already bounds the missing amounts.
+                # Platform-cost budget: attributed cost from finalized
+                # events plus the snapshotted estimates of in-flight
+                # (active) reservations, so overlapping priced calls cannot
+                # each pass against the same remaining budget.
                 spent = sum(
                     event.cost_micros
                     for event in self._usage_events.values()
                     if event.customer_id == candidate.customer_id
                     and event.subscription_id == candidate.subscription_id
                 )
-                if spent + max(0, estimated_cost_micros) > budget_limit_micros:
+                in_flight = sum(
+                    _reservation_estimate_micros(item)
+                    for item in self._reservations.values()
+                    if item.state is UsageReservationState.RESERVED
+                    and item.customer_id == candidate.customer_id
+                    and item.subscription_id == candidate.subscription_id
+                )
+                estimated = max(0, estimated_cost_micros)
+                if spent + in_flight + estimated > budget_limit_micros:
                     raise EntitlementDenied(
                         "budget.platform_cost exceeded: "
                         f"limit_micros={budget_limit_micros}, "
                         f"spent_micros={spent}, "
-                        f"estimated_micros={max(0, estimated_cost_micros)}"
+                        f"in_flight_micros={in_flight}, "
+                        f"estimated_micros={estimated}"
                     )
             self._reservations[candidate.id] = candidate
             self._reservation_by_dedupe[candidate.dedupe_key] = candidate.id
@@ -1084,6 +1106,15 @@ class InMemoryCommercialRepository:
             raise ActiveSubscriptionExists(
                 "customer already has a trialing, active, or past-due subscription"
             )
+
+
+def _reservation_estimate_micros(reservation: UsageReservation) -> int:
+    """Read a reservation's snapshotted cost estimate; 0 when unpriced."""
+
+    value = thaw_json(reservation.metadata).get("estimated_cost_micros")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _same_price_entry(existing: PriceEntry, candidate: PriceEntry) -> bool:

@@ -333,6 +333,12 @@ class PostgresCommercialRepository:
                         candidate.created_at,
                     )
                 except Exception as exc:
+                    # Only a primary-key (id) collision maps to this
+                    # conflict; the row key is absorbed by ON CONFLICT, so
+                    # anything else (CHECK violation, connection failure)
+                    # propagates unchanged instead of masquerading as one.
+                    if getattr(exc, "sqlstate", None) != "23505":
+                        raise
                     raise CommercialConflict(
                         f"price entry id already exists: {candidate.id}"
                     ) from exc
@@ -861,25 +867,33 @@ class PostgresCommercialRepository:
                     f"used={consumed}, reserved={reserved}, requested={candidate.quantity}"
                 )
             if budget_limit_micros is not None:
-                # Platform-cost budget: finalized events only (their rows
-                # already carry attributed cost).  Held but unfinalized
-                # reservations have no attributed cost yet; their meter
-                # quota already bounds the missing amounts.
+                # Platform-cost budget: attributed cost from finalized
+                # events plus the snapshotted estimates of in-flight
+                # (active) reservations, so overlapping priced calls cannot
+                # each pass against the same remaining budget.
                 spent = await connection.fetchval(
                     """
-                    SELECT COALESCE(SUM(cost_micros), 0)
-                    FROM commercial.usage_event
-                    WHERE customer_id = $1 AND subscription_id = $2
+                    SELECT
+                        (SELECT COALESCE(SUM(cost_micros), 0)
+                         FROM commercial.usage_event
+                         WHERE customer_id = $1 AND subscription_id = $2)
+                        +
+                        (SELECT COALESCE(
+                            SUM((metadata_json->>'estimated_cost_micros')::bigint), 0)
+                         FROM commercial.usage_reservation
+                         WHERE customer_id = $1 AND subscription_id = $2
+                           AND state = 'active')
                     """,
                     candidate.customer_id,
                     candidate.subscription_id,
                 )
-                if spent + max(0, estimated_cost_micros) > budget_limit_micros:
+                estimated = max(0, estimated_cost_micros)
+                if spent + estimated > budget_limit_micros:
                     raise EntitlementDenied(
                         "budget.platform_cost exceeded: "
                         f"limit_micros={budget_limit_micros}, "
-                        f"spent_micros={spent}, "
-                        f"estimated_micros={max(0, estimated_cost_micros)}"
+                        f"spent_and_in_flight_micros={spent}, "
+                        f"estimated_micros={estimated}"
                     )
             try:
                 row = await connection.fetchrow(
