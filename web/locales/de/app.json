@@ -286,6 +286,8 @@
   "No orders yet.": "Noch keine Bestellungen.",
   "All statuses": "Alle Status",
   "pending_payment": "ausstehende Zahlung",
+  "paid": "bezahlt",
+  "refunded": "erstattet",
   "fulfilled": "erfüllt",
   "canceled": "storniert",
   "Amount": "Betrag",

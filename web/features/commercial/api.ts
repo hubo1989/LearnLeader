@@ -120,10 +120,20 @@ export async function markOrderPaid(
   return mapOrder(raw);
 }
 
-export async function fetchAdminOrders(status?: string): Promise<CommercialOrder[]> {
-  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+export async function fetchAdminOrders(
+  status?: string,
+  limit = 100,
+  offset = 0,
+): Promise<CommercialOrder[]> {
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
   const raw = await readJson<Record<string, unknown>[]>(
-    await apiFetch(apiUrl(`/api/v1/admin/commercial/orders${query}`), { cache: "no-store" }),
+    await apiFetch(
+      apiUrl(`/api/v1/admin/commercial/orders?${params.toString()}`),
+      { cache: "no-store" },
+    ),
   );
   return raw.map(mapOrder);
 }

@@ -814,14 +814,32 @@ class PostgresCommercialRepository:
             )
         return tuple(_reservation(row) for row in rows)
 
-    async def list_usage_events(self, customer_id: str) -> tuple[UsageEvent, ...]:
+    async def list_usage_events(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[UsageEvent, ...]:
+        # Filters are pushed down so a long-lived ledger never fully loads.
         async with self._connection() as connection:
             rows = await connection.fetch(
                 """
                 SELECT * FROM commercial.usage_event
-                WHERE customer_id = $1 ORDER BY created_at, id
+                WHERE customer_id = $1
+                  AND ($2::timestamptz IS NULL OR occurred_at >= $2)
+                  AND ($3::timestamptz IS NULL OR occurred_at < $3)
+                  AND ($4::text IS NULL OR meter = $4)
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT $5
                 """,
                 customer_id,
+                since,
+                until,
+                meter,
+                limit if limit is not None else 2**31 - 1,
             )
         return tuple(_usage_event(row) for row in rows)
 
@@ -1090,6 +1108,7 @@ class PostgresCommercialRepository:
         *,
         status: str | None = None,
         limit: int = 200,
+        offset: int = 0,
     ) -> tuple[PurchaseOrder, ...]:
         async with self._connection() as connection:
             rows = await connection.fetch(
@@ -1097,10 +1116,11 @@ class PostgresCommercialRepository:
                 SELECT * FROM commercial.purchase_order
                 WHERE ($1::text IS NULL OR status = $1)
                 ORDER BY created_at DESC, id DESC
-                LIMIT $2
+                LIMIT $2 OFFSET $3
                 """,
                 status,
                 max(1, limit),
+                max(0, offset),
             )
         return tuple(_order(row) for row in rows)
 

@@ -286,6 +286,8 @@
   "No orders yet.": "暂无订单。",
   "All statuses": "全部状态",
   "pending_payment": "待付款",
+  "paid": "已支付",
+  "refunded": "已退款",
   "fulfilled": "已兑现",
   "canceled": "已取消",
   "Amount": "金额",

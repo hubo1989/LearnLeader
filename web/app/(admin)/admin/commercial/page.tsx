@@ -1,27 +1,58 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { fetchAdminOrders, markOrderPaid } from "@/features/commercial/api";
-import type { CommercialOrder } from "@/features/commercial/types";
+import {
+  COMMERCIAL_ORDER_STATUSES,
+  type CommercialOrder,
+  type CommercialOrderStatus,
+} from "@/features/commercial/types";
+import { formatMinorAmount } from "@/lib/currency";
 
 export default function AdminCommercialPage() {
   const { t } = useTranslation();
   const [orders, setOrders] = useState<CommercialOrder[]>([]);
-  const [statusFilter, setStatusFilter] = useState<string>("pending_payment");
+  const [statusFilter, setStatusFilter] = useState<CommercialOrderStatus | "">( "pending_payment" );
   const [references, setReferences] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+
+  // A slow response for an old filter must not overwrite the current one.
+  const requestSeq = useRef(0);
 
   const refresh = useCallback(async () => {
+    const seq = ++requestSeq.current;
     try {
-      setOrders(await fetchAdminOrders(statusFilter || undefined));
+      const fetched = await fetchAdminOrders(statusFilter || undefined, 100, 0);
+      if (seq !== requestSeq.current) return;
+      setOrders(fetched);
+      setHasMore(fetched.length >= 100);
       setError(null);
     } catch (err) {
+      if (seq !== requestSeq.current) return;
       setError(err instanceof Error ? err.message : String(err));
     }
   }, [statusFilter]);
+
+  const loadMore = useCallback(async () => {
+    const seq = ++requestSeq.current;
+    try {
+      const fetched = await fetchAdminOrders(
+        statusFilter || undefined,
+        100,
+        orders.length,
+      );
+      if (seq !== requestSeq.current) return;
+      setOrders((current) => [...current, ...fetched]);
+      setHasMore(fetched.length >= 100);
+    } catch (err) {
+      if (seq !== requestSeq.current) return;
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [statusFilter, orders.length]);
 
   useEffect(() => {
     void refresh();
@@ -45,13 +76,17 @@ export default function AdminCommercialPage() {
         <h1 className="text-lg font-semibold">{t("Orders")}</h1>
         <select
           value={statusFilter}
-          onChange={(event) => setStatusFilter(event.target.value)}
+          onChange={(event) =>
+            setStatusFilter(event.target.value as CommercialOrderStatus | "")
+          }
           className="rounded-md border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-sm"
         >
           <option value="">{t("All statuses")}</option>
-          <option value="pending_payment">{t("pending_payment")}</option>
-          <option value="fulfilled">{t("fulfilled")}</option>
-          <option value="canceled">{t("canceled")}</option>
+          {COMMERCIAL_ORDER_STATUSES.map((status) => (
+            <option key={status} value={status}>
+              {t(status)}
+            </option>
+          ))}
         </select>
       </div>
 
@@ -78,7 +113,7 @@ export default function AdminCommercialPage() {
                 <td className="p-3 font-mono text-xs">{order.id}</td>
                 <td className="p-3">{order.status}</td>
                 <td className="p-3">
-                  {(order.priceMinor / 100).toLocaleString()} {order.currency}
+                  {formatMinorAmount(order.priceMinor, order.currency)}
                 </td>
                 <td className="p-3">{new Date(order.createdAt).toLocaleString()}</td>
                 <td className="p-3">
@@ -110,6 +145,20 @@ export default function AdminCommercialPage() {
                 </td>
               </tr>
             ))}
+            {hasMore ? (
+              <tr>
+                <td colSpan={5} className="p-3 text-center">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void loadMore()}
+                    className="rounded-md border border-[var(--border)] px-3 py-1 text-xs disabled:opacity-50"
+                  >
+                    {t("Load more")}
+                  </button>
+                </td>
+              </tr>
+            ) : null}
             {orders.length === 0 ? (
               <tr>
                 <td colSpan={5} className="p-3 text-[var(--muted-foreground)]">

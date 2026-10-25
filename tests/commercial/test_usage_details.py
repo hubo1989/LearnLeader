@@ -85,10 +85,11 @@ async def test_usage_details_aggregates_by_day_model_and_estimated_share(
     assert details["by_day"]["2026-08-07"] == {"llm_tokens": 30}
     assert details["by_model"]["llm_tokens"] == {"gpt-x": 50, "gpt-y": 30}
     assert details["estimated"]["events"] == 1
-    assert details["estimated"]["quantity"] == 30
-    assert details["estimated"]["share"] == pytest.approx(30 / 85)
-    assert [event["model"] for event in details["events"]] == ["gpt-x", "mineru", "gpt-y"]
-    assert details["events"][0]["usage_units"] == {"llm_tokens": 50}
+    assert details["estimated"]["event_share"] == pytest.approx(1 / 3)
+    assert details["estimated"]["by_meter"] == {"llm_tokens": pytest.approx(30 / 80)}
+    assert details["truncated"] is False
+    assert [event["model"] for event in details["events"]] == ["gpt-y", "mineru", "gpt-x"]
+    assert details["events"][0]["usage_units"] == {"llm_tokens": 30}
     assert details["events"][0]["price_version"]
 
 
@@ -135,6 +136,10 @@ async def test_usage_details_filters_by_window_and_meter(commercial_harness):
     )
     assert window["totals"] == {"llm_tokens": 40, "parse_pages": 5}
 
+    page = await service.usage_details(customer.id, limit=2)
+    assert page["truncated"] is True
+    assert len(page["events"]) == 2
+
     only_llm = await service.usage_details(customer.id, meter="llm_tokens")
     assert only_llm["totals"] == {"llm_tokens": 90}
     assert {event["model"] for event in only_llm["events"]} == {"gpt-x", "gpt-y"}
@@ -155,4 +160,4 @@ async def test_usage_details_on_empty_ledger_returns_zero_share(commercial_harne
     details = await service.usage_details(customer.id)
     assert details["events"] == []
     assert details["totals"] == {}
-    assert details["estimated"] == {"events": 0, "quantity": 0, "share": 0.0}
+    assert details["estimated"] == {"events": 0, "event_share": 0.0, "by_meter": {}}

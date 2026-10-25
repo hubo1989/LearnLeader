@@ -489,13 +489,18 @@ class CommercialControlPlane:
         since: datetime | None = None,
         until: datetime | None = None,
         meter: str | None = None,
+        limit: int = 500,
     ) -> dict[str, Any]:
         """Filtered usage-event read model with per-day/per-model aggregates.
 
         A per-user accounting view over the durable ledger: raw events plus
-        rollups that stay derived (never a billing source of truth). The
-        estimated share flags provider calls whose usage the provider never
-        reported, so a rising value is a metering-health signal.
+        rollups that stay derived (never a billing source of truth). Filters
+        are pushed into the repository query so a long-lived ledger never
+        fully loads; ``limit`` caps the newest-first event page and the
+        ``truncated`` flag says whether older events exist in the window.
+        Estimated shares are per meter — mixing tokens with pages in one
+        ratio would be dimensionally meaningless — plus an event-count share
+        for a quick metering-health read.
         """
 
         clean_customer_id = _required(customer_id, "customer_id")
@@ -504,18 +509,25 @@ class CommercialControlPlane:
         if until is not None:
             _require_aware(until, "until")
         clean_meter = _optional(meter)
-        events = [
-            event
-            for event in await self.repository.list_usage_events(clean_customer_id)
-            if (since is None or event.occurred_at >= since)
-            and (until is None or event.occurred_at < until)
-            and (clean_meter is None or event.meter == clean_meter)
-        ]
+        if isinstance(limit, bool) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        events = list(
+            await self.repository.list_usage_events(
+                clean_customer_id,
+                since=since,
+                until=until,
+                meter=clean_meter,
+                limit=limit + 1,
+            )
+        )
+        truncated = len(events) > limit
+        if truncated:
+            events = events[:limit]
         totals: dict[str, int] = {}
         by_day: dict[str, dict[str, int]] = {}
         by_model: dict[str, dict[str, int]] = {}
+        estimated_by_meter: dict[str, int] = {}
         estimated_events = 0
-        estimated_quantity = 0
         for event in events:
             quantity = int(event.quantity)
             totals[event.meter] = totals.get(event.meter, 0) + quantity
@@ -527,8 +539,12 @@ class CommercialControlPlane:
             by_model[event.meter][model_key] += quantity
             if event.is_estimated:
                 estimated_events += 1
-                estimated_quantity += quantity
-        total_quantity = sum(totals.values())
+                estimated_by_meter[event.meter] = estimated_by_meter.get(event.meter, 0) + quantity
+        share_by_meter = {
+            meter_key: (quantity / totals[meter_key]) if totals.get(meter_key) else 0.0
+            for meter_key, quantity in estimated_by_meter.items()
+        }
+        total_events = len(events)
         return {
             "events": [
                 {
@@ -551,9 +567,10 @@ class CommercialControlPlane:
             "by_model": by_model,
             "estimated": {
                 "events": estimated_events,
-                "quantity": estimated_quantity,
-                "share": (estimated_quantity / total_quantity) if total_quantity else 0.0,
+                "event_share": (estimated_events / total_events if total_events else 0.0),
+                "by_meter": share_by_meter,
             },
+            "truncated": truncated,
             "since": since.isoformat() if since is not None else None,
             "until": until.isoformat() if until is not None else None,
         }

@@ -521,18 +521,29 @@ class InMemoryCommercialRepository:
                 )
             )
 
-    async def list_usage_events(self, customer_id: str) -> tuple[UsageEvent, ...]:
+    async def list_usage_events(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[UsageEvent, ...]:
         async with self._lock:
-            return tuple(
-                sorted(
-                    (
-                        item
-                        for item in self._usage_events.values()
-                        if item.customer_id == customer_id
-                    ),
-                    key=lambda item: (item.created_at, item.id),
-                )
+            selected = sorted(
+                (
+                    item
+                    for item in self._usage_events.values()
+                    if item.customer_id == customer_id
+                    and (since is None or item.occurred_at >= since)
+                    and (until is None or item.occurred_at < until)
+                    and (meter is None or item.meter == meter)
+                ),
+                key=lambda item: (item.occurred_at, item.id),
+                reverse=True,
             )
+            return tuple(selected[:limit] if limit is not None else selected)
 
     async def finalize_usage(
         self,
@@ -701,6 +712,7 @@ class InMemoryCommercialRepository:
         *,
         status: str | None = None,
         limit: int = 200,
+        offset: int = 0,
     ) -> tuple[PurchaseOrder, ...]:
         async with self._lock:
             orders = sorted(
@@ -712,7 +724,7 @@ class InMemoryCommercialRepository:
                 key=lambda item: (item.created_at, item.id),
                 reverse=True,
             )
-            return tuple(orders[: max(1, limit)])
+            return tuple(orders[max(0, offset) : max(0, offset) + max(1, limit)])
 
     async def pay_and_fulfill_order(
         self,

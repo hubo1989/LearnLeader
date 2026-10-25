@@ -271,6 +271,8 @@
   "No orders yet.": "Замовлень ще немає.",
   "All statuses": "Усі стани",
   "pending_payment": "очікує на оплату",
+  "paid": "оплачено",
+  "refunded": "повернено",
   "fulfilled": "виконано",
   "canceled": "скасовано",
   "Amount": "Сума",

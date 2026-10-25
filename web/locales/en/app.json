@@ -286,6 +286,8 @@
   "No orders yet.": "No orders yet.",
   "All statuses": "All statuses",
   "pending_payment": "pending_payment",
+  "paid": "paid",
+  "refunded": "refunded",
   "fulfilled": "fulfilled",
   "canceled": "canceled",
   "Amount": "Amount",

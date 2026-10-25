@@ -100,7 +100,15 @@ class CommercialRepository(Protocol):
         customer_id: str,
     ) -> tuple[UsageReservation, ...]: ...
 
-    async def list_usage_events(self, customer_id: str) -> tuple[UsageEvent, ...]: ...
+    async def list_usage_events(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[UsageEvent, ...]: ...
 
     async def finalize_usage(
         self,
@@ -134,6 +142,7 @@ class CommercialRepository(Protocol):
         *,
         status: str | None = None,
         limit: int = 200,
+        offset: int = 0,
     ) -> tuple[PurchaseOrder, ...]: ...
 
     async def pay_and_fulfill_order(

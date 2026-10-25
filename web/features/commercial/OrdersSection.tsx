@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -10,10 +10,9 @@ import {
   fetchCommercialPlans,
 } from "./api";
 import type { CommercialOrder, CommercialPlan } from "./types";
+import { formatMinorAmount } from "@/lib/currency";
 
-function formatPrice(priceMinor: number, currency: string): string {
-  return `${(priceMinor / 100).toLocaleString()} ${currency}`;
-}
+const formatPrice = formatMinorAmount;
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString();
@@ -35,6 +34,17 @@ export default function OrdersSection() {
       setPlans(planList.filter((plan) => plan.priceMinor > 0));
       setOrders(orderList);
       setError(null);
+      // Drop idempotency keys whose order is no longer open: the server
+      // treats a stable key as "retry this order", so a fresh purchase
+      // after cancel/fulfill must mint a fresh key.
+      const openPlanIds = new Set(
+        orderList
+          .filter((order) => order.status === "pending_payment")
+          .map((order) => order.planVersionId),
+      );
+      for (const key of orderKeys.current.keys()) {
+        if (!openPlanIds.has(key)) orderKeys.current.delete(key);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -44,6 +54,10 @@ export default function OrdersSection() {
     void refresh();
   }, [refresh]);
 
+  // One idempotency key per plan until that order leaves pending: a
+  // network retry reuses it and lands on the same server-side order.
+  const orderKeys = useRef<Map<string, string>>(new Map());
+
   const pendingOrder = useMemo(
     () => orders.find((order) => order.status === "pending_payment") ?? null,
     [orders],
@@ -52,10 +66,15 @@ export default function OrdersSection() {
   async function handleOrder(plan: CommercialPlan) {
     setBusy(true);
     try {
-      await createCommercialOrder({
-        planVersionId: plan.id,
-        idempotencyKey: `web-${plan.id}-${Date.now()}`,
-      });
+      let key = orderKeys.current.get(plan.id);
+      if (!key) {
+        key =
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? `web-${plan.id}-${crypto.randomUUID()}`
+            : `web-${plan.id}-${Math.random().toString(36).slice(2)}`;
+        orderKeys.current.set(plan.id, key);
+      }
+      await createCommercialOrder({ planVersionId: plan.id, idempotencyKey: key });
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

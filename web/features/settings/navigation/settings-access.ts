@@ -9,6 +9,8 @@ export interface SettingsAccess {
   showLearnerOnly: boolean;
   /** Ordinary standard/custom accounts may act as authorized guardians. */
   showGuardianOnly: boolean;
+  /** Commercial plans/orders pages need hosted commercial mode for a customer. */
+  showCommercialOnly: boolean;
 }
 
 export const PENDING_SETTINGS_ACCESS: SettingsAccess = {
@@ -16,6 +18,7 @@ export const PENDING_SETTINGS_ACCESS: SettingsAccess = {
   hideAdminOnly: true,
   showLearnerOnly: false,
   showGuardianOnly: false,
+  showCommercialOnly: false,
 };
 
 /** Convert the backend's account identity into the settings visibility model. */
@@ -32,6 +35,7 @@ export function settingsAccessFromAuthStatus(
   return {
     resolved: true,
     hideAdminOnly: Boolean(authStatus.enabled) && !authStatus.is_admin,
+    showCommercialOnly: Boolean(authStatus.commercial_enabled) && !authStatus.is_admin,
     showLearnerOnly:
       ordinaryAuthenticatedUser && authStatus.preset === "learner",
     showGuardianOnly:

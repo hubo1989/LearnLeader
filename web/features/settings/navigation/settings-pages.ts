@@ -91,6 +91,7 @@ const extraPages: SettingsLeaf[] = [
     icon: Receipt,
     href: '/settings/orders',
     tile: '',
+    commercialOnly: true,
   },
   {
     key: 'archive',

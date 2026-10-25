@@ -63,6 +63,7 @@ async def list_orders(
     status_filter: str | None = Query(default=None, alias="status"),
     owner_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> list[CommercialOrderResponse]:
     """The order queue; filter to ``pending_payment`` for the worklist."""
 
@@ -77,6 +78,7 @@ async def list_orders(
         orders = await control_plane.repository.list_all_orders(
             status=status_filter,
             limit=limit,
+            offset=offset,
         )
     return [_order_response(order) for order in orders]
 
