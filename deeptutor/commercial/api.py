@@ -101,6 +101,51 @@ async def get_my_commercial_access(
     }
 
 
+@router.get("/commercial/billing/preview")
+async def get_my_billing_preview(
+    _payload: TokenPayload | None = Depends(require_commercial_access),
+) -> dict[str, Any]:
+    """Estimate the caller's current-period bill; nothing is committed.
+
+    Fixed charge from the subscription's plan snapshot plus overage
+    estimated with the ``list_price`` catalog; catalog misses are flagged
+    ``unpriced`` instead of guessed.
+    """
+
+    runtime = get_commercial_runtime()
+    if not runtime.settings.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Commercial billing is not enabled.",
+        )
+    user = get_current_user()
+    if user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrators are not metered; nothing to preview.",
+        )
+    access = get_commercial_access()
+    if access is None or access.owner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Subscription state is temporarily unavailable.",
+        )
+    control_plane = runtime.control_plane
+    if control_plane is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Subscription state is temporarily unavailable.",
+        )
+    from .errors import CommercialError, CommercialNotFound
+
+    try:
+        return await control_plane.billing_preview(access.resolved.customer_id)
+    except CommercialNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CommercialError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
 @router.get("/commercial/usage")
 async def get_my_commercial_usage(
     _payload: TokenPayload | None = Depends(require_commercial_access),
