@@ -40,3 +40,39 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Budget accounting sums raw micros across the platform_cost ledger, so a
+-- second currency in that ledger would compare unrelated amounts.  The
+-- application pre-checks with a friendly error; this trigger closes the
+-- concurrent-publication window (updates are already blocked as immutable).
+CREATE OR REPLACE FUNCTION commercial.enforce_price_ledger_currency()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM commercial.price_version
+        WHERE kind = NEW.kind
+          AND currency <> NEW.currency
+    ) THEN
+        RAISE EXCEPTION 'price ledger % must stay single-currency', NEW.kind
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'price_version_ledger_currency'
+          AND tgrelid = 'commercial.price_version'::regclass
+    ) THEN
+        CREATE TRIGGER price_version_ledger_currency
+            BEFORE INSERT ON commercial.price_version
+            FOR EACH ROW EXECUTE FUNCTION commercial.enforce_price_ledger_currency();
+    END IF;
+END
+$$;

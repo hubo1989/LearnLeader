@@ -14,6 +14,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .keys import canonical_json
+
 
 class SubscriptionStatus(str, Enum):
     TRIALING = "trialing"
@@ -80,6 +82,12 @@ UNPRICED_PRICE_VERSION = "unpriced-v1"
 #: One budget credit equals this many micros of platform cost.
 PLATFORM_COST_CREDIT_MICROS = 1_000
 
+#: Server-owned reservation metadata key holding the snapshotted platform
+#: cost estimate of that reservation; excluded from replay fingerprints
+#: because it is injected after the idempotency comparison, priced at
+#: first-attempt time.
+ESTIMATED_COST_METADATA_KEY = "estimated_cost_micros"
+
 
 ALLOWED_SUBSCRIPTION_TRANSITIONS: Mapping[SubscriptionStatus, frozenset[SubscriptionStatus]] = {
     SubscriptionStatus.TRIALING: frozenset(
@@ -103,6 +111,19 @@ def freeze_json(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(freeze_json(item) for item in value)
     return value
+
+
+def reservation_metadata_fingerprint(metadata: Any) -> str:
+    """Canonical replay fingerprint that ignores server-owned reserved keys.
+
+    ``estimated_cost_micros`` is injected by the control plane after the
+    idempotency comparison and is priced at first-attempt time, so a replay
+    that has not re-resolved the catalog yet must still compare equal.
+    """
+
+    thawed = dict(thaw_json(metadata) or {})
+    thawed.pop(ESTIMATED_COST_METADATA_KEY, None)
+    return canonical_json(thawed)
 
 
 def thaw_json(value: Any) -> Any:

@@ -48,6 +48,7 @@ from .models import (
     UsageReservation,
     UsageReservationState,
     WebhookEvent,
+    reservation_metadata_fingerprint,
     thaw_json,
 )
 
@@ -870,7 +871,9 @@ class PostgresCommercialRepository:
                 # Platform-cost budget: attributed cost from finalized
                 # events plus the snapshotted estimates of in-flight
                 # (active) reservations, so overlapping priced calls cannot
-                # each pass against the same remaining budget.
+                # each pass against the same remaining budget.  The
+                # jsonb_typeof guard keeps malformed caller-supplied values
+                # from crashing the cast; they simply count as zero.
                 spent = await connection.fetchval(
                     """
                     SELECT
@@ -878,8 +881,12 @@ class PostgresCommercialRepository:
                          FROM commercial.usage_event
                          WHERE customer_id = $1 AND subscription_id = $2)
                         +
-                        (SELECT COALESCE(
-                            SUM((metadata_json->>'estimated_cost_micros')::bigint), 0)
+                        (SELECT COALESCE(SUM(
+                            CASE
+                                WHEN (metadata_json->>'estimated_cost_micros') ~ '^\d+$'
+                                THEN (metadata_json->>'estimated_cost_micros')::bigint
+                                ELSE 0
+                            END), 0)
                          FROM commercial.usage_reservation
                          WHERE customer_id = $1 AND subscription_id = $2
                            AND state = 'active')
@@ -1731,13 +1738,13 @@ def _assert_same_reservation(
         existing.subscription_id,
         existing.meter,
         existing.quantity,
-        canonical_json(thaw_json(existing.metadata)),
+        reservation_metadata_fingerprint(existing.metadata),
     ) != (
         candidate.customer_id,
         candidate.subscription_id,
         candidate.meter,
         candidate.quantity,
-        canonical_json(thaw_json(candidate.metadata)),
+        reservation_metadata_fingerprint(candidate.metadata),
     ):
         raise IdempotencyConflict(
             "usage request id was replayed with different reservation semantics"

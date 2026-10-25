@@ -81,6 +81,11 @@ def test_pricing_migration_defines_immutable_price_catalog() -> None:
     # Catalog rows are immutable like plan versions.
     assert "price_version_immutable" in sql
     assert "prevent_plan_version_mutation" in sql
+    # The platform_cost ledger stays single-currency even under concurrent
+    # publication (the service pre-check cannot close that window alone).
+    assert "enforce_price_ledger_currency" in sql
+    assert "price_version_ledger_currency" in sql
+    assert "must stay single-currency" in sql
 
 
 @pytest.mark.asyncio

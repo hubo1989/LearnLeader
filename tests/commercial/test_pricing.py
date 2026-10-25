@@ -619,6 +619,86 @@ async def test_overlapping_reservations_share_the_budget(commercial_harness):
     assert other.meter == "parse_pages"
 
 
+async def test_reserve_replay_matches_despite_snapshot_key(commercial_harness):
+    """The server-injected estimate must not break idempotent replays."""
+
+    service, repository, clock = commercial_harness
+    del repository, clock
+    customer, plan = await _metered_customer(
+        service, token_limit=10_000, extra={"budget.platform_cost_credits": 5}
+    )
+    await _publish_platform_catalog(service)
+
+    original = await service.reserve_usage(
+        customer.id,
+        "llm_tokens",
+        10,
+        "replay-1",
+        metadata={"provider": "openai", "model": "gpt-test"},
+    )
+    assert original.metadata["estimated_cost_micros"] == 30
+
+    # A retry carries caller metadata only — the estimate is injected after
+    # the fingerprint comparison — so it must return the stored reservation.
+    replay = await service.reserve_usage(
+        customer.id,
+        "llm_tokens",
+        10,
+        "replay-1",
+        metadata={"provider": "openai", "model": "gpt-test"},
+    )
+    assert replay.id == original.id
+
+    # Caller-supplied values for the reserved key are dropped, not trusted.
+    scrubbed = await service.reserve_usage(
+        customer.id,
+        "llm_tokens",
+        5,
+        "replay-2",
+        metadata={"estimated_cost_micros": "not-a-number"},
+    )
+    assert "estimated_cost_micros" not in scrubbed.metadata or isinstance(
+        scrubbed.metadata["estimated_cost_micros"], int
+    )
+
+
+async def test_repository_rejects_duplicate_batch_rows_and_second_currency(
+    commercial_harness,
+):
+    """Repository-level guards mirror the service checks and the DB trigger."""
+
+    from deeptutor.commercial.errors import CommercialConflict
+    from deeptutor.commercial.models import PriceEntry
+
+    service, repository, clock = commercial_harness
+    del clock
+    now = service._now()
+
+    def _entry(entry_id: str, price_version: str, currency: str = "CNY") -> PriceEntry:
+        return PriceEntry(
+            id=entry_id,
+            price_version=price_version,
+            kind="platform_cost",
+            meter="llm_tokens",
+            model_tier="default",
+            unit_price_micros=1,
+            currency=currency,
+            effective_from=now,
+            created_at=now,
+        )
+
+    # Duplicate row key inside one batch.
+    with pytest.raises(CommercialConflict, match="duplicate price row"):
+        await repository.publish_price_entries(
+            (_entry("p1", "dup-batch"), _entry("p2", "dup-batch"))
+        )
+
+    # A second platform_cost currency is rejected under the repository lock.
+    await repository.publish_price_entries((_entry("p3", "cny-v1"),))
+    with pytest.raises(CommercialConflict, match="single currency"):
+        await repository.publish_price_entries((_entry("p4", "usd-v1", "USD"),))
+
+
 async def test_publish_rejects_sentinel_version_and_second_platform_currency(
     commercial_harness,
 ):

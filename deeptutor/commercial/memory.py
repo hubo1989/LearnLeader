@@ -40,6 +40,7 @@ from .models import (
     UsageReservation,
     UsageReservationState,
     WebhookEvent,
+    reservation_metadata_fingerprint,
     thaw_json,
 )
 
@@ -185,6 +186,7 @@ class InMemoryCommercialRepository:
             # earlier rows of the same batch published.
             published: list[PriceEntry] = []
             pending: list[PriceEntry] = []
+            batch_rows: set[tuple[str, str, str, str]] = set()
             for candidate in entries:
                 row_key = (
                     candidate.price_version,
@@ -192,6 +194,12 @@ class InMemoryCommercialRepository:
                     candidate.meter,
                     candidate.model_tier,
                 )
+                if row_key in batch_rows:
+                    raise CommercialConflict(
+                        "duplicate price row in one catalog publication: "
+                        f"{candidate.meter}/{candidate.model_tier}"
+                    )
+                batch_rows.add(row_key)
                 existing_id = self._price_by_row.get(row_key)
                 if existing_id is not None:
                     existing = self._prices[existing_id]
@@ -205,6 +213,24 @@ class InMemoryCommercialRepository:
                     raise CommercialConflict(f"price entry id already exists: {candidate.id}")
                 published.append(candidate)
                 pending.append(candidate)
+            # Single currency per platform_cost ledger, under the same lock
+            # as the insert (mirrors the Postgres ledger-currency trigger).
+            for candidate in pending:
+                if candidate.kind != "platform_cost":
+                    continue
+                conflicting = any(
+                    entry.kind == candidate.kind and entry.currency != candidate.currency
+                    for entry in self._prices.values()
+                ) or any(
+                    entry.kind == candidate.kind
+                    and entry.currency != candidate.currency
+                    and entry is not candidate
+                    for entry in pending
+                )
+                if conflicting:
+                    raise CommercialConflict(
+                        "platform_cost catalog rows must share a single currency"
+                    )
             for candidate in pending:
                 self._prices[candidate.id] = candidate
                 self._price_by_row[
@@ -603,13 +629,13 @@ class InMemoryCommercialRepository:
             existing.subscription_id,
             existing.meter,
             existing.quantity,
-            canonical_json(thaw_json(existing.metadata)),
+            reservation_metadata_fingerprint(existing.metadata),
         ) != (
             candidate.customer_id,
             candidate.subscription_id,
             candidate.meter,
             candidate.quantity,
-            canonical_json(thaw_json(candidate.metadata)),
+            reservation_metadata_fingerprint(candidate.metadata),
         ):
             raise IdempotencyConflict(
                 "usage request id was replayed with different reservation semantics"

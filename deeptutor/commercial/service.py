@@ -23,6 +23,7 @@ from .keys import (
 )
 from .models import (
     DEFAULT_MODEL_TIER,
+    ESTIMATED_COST_METADATA_KEY,
     PLATFORM_COST_CREDIT_MICROS,
     PRICE_KINDS,
     UNPRICED_PRICE_VERSION,
@@ -44,6 +45,7 @@ from .models import (
     UsageReservation,
     UsageReservationState,
     WebhookEvent,
+    reservation_metadata_fingerprint,
     thaw_json,
 )
 from .repository import CommercialRepository
@@ -457,6 +459,10 @@ class CommercialControlPlane:
         clean_meter = _required(meter, "meter")
         clean_request_id = _required(request_id, "request_id")
         metadata_value = dict(metadata or {})
+        # The budget estimate is a server-owned reserved key: caller input
+        # is dropped here and the value is injected only after pricing, so
+        # a replay's fingerprint matches regardless of when it was taken.
+        metadata_value.pop(ESTIMATED_COST_METADATA_KEY, None)
         canonical_json(metadata_value)
         dedupe_key = request_dedupe_key(
             "usage-reserve",
@@ -472,12 +478,12 @@ class CommercialControlPlane:
                 existing.customer_id,
                 existing.meter,
                 existing.quantity,
-                canonical_json(thaw_json(existing.metadata)),
+                reservation_metadata_fingerprint(existing.metadata),
             ) != (
                 clean_customer_id,
                 clean_meter,
                 quantity,
-                canonical_json(metadata_value),
+                reservation_metadata_fingerprint(metadata_value),
             ):
                 raise IdempotencyConflict(
                     "usage request id was replayed with different reservation semantics"
@@ -510,7 +516,7 @@ class CommercialControlPlane:
                 estimated_cost_micros = catalog_entry.unit_price_micros * quantity
                 # Snapshot the estimate on the reservation so the budget
                 # gate can also count in-flight reservations atomically.
-                metadata_value["estimated_cost_micros"] = estimated_cost_micros
+                metadata_value[ESTIMATED_COST_METADATA_KEY] = estimated_cost_micros
         period_start, period_end = _quota_period(
             quota_policy.window,
             now,
@@ -729,6 +735,14 @@ class CommercialControlPlane:
             if event.subscription_id == subscription.id
         ]
         at = self._now()
+        # Load the list_price ledger once and resolve locally: pricing each
+        # overage event at its own instant would otherwise be one catalog
+        # query per event on this user-facing endpoint.
+        catalog = [
+            entry
+            for entry in await self.repository.list_price_entries()
+            if entry.kind == PriceKind.LIST_PRICE.value
+        ]
         usage_rows: list[dict[str, Any]] = []
         overage_rows: list[dict[str, Any]] = []
         unpriced_meters: list[str] = []
@@ -781,12 +795,7 @@ class CommercialControlPlane:
                 if chargeable <= 0:
                     continue
                 tier = _resolve_model_tier(resolved.values, event.model)
-                entry = await self.repository.resolve_price(
-                    PriceKind.LIST_PRICE.value,
-                    meter,
-                    tier,
-                    event.occurred_at,
-                )
+                entry = _resolve_price_from(catalog, meter, tier, event.occurred_at)
                 bucket_key = (tier, entry.id if entry is not None else None)
                 bucket = buckets.get(bucket_key)
                 if bucket is None:
@@ -1233,8 +1242,9 @@ def _resolve_model_tier(values: Mapping[str, Any], model: str | None) -> str:
 
     The ``pricing.model_tiers`` entitlement maps model ids to tier names.
     Absent models, a missing mapping, or non-string tier values all resolve
-    to the ``default`` tier (see ``_resolve_catalog_price`` for why the
-    fallback is lenient).
+    to the ``default`` tier: pricing falls back leniently because an
+    unpriced event (cost zero) is recoverable while a dropped usage event
+    is not.
     """
 
     tiers = values.get("pricing.model_tiers")
@@ -1245,6 +1255,32 @@ def _resolve_model_tier(values: Mapping[str, Any], model: str | None) -> str:
             if cleaned:
                 return cleaned
     return DEFAULT_MODEL_TIER
+
+
+def _resolve_price_from(
+    entries: Sequence[PriceEntry],
+    meter: str,
+    model_tier: str,
+    at: datetime,
+) -> PriceEntry | None:
+    """Resolve a price from an in-memory catalog slice (see ``resolve_price``).
+
+    Mirrors the repositories' resolution rule so read models can price many
+    events without a query each: latest ``effective_from`` at or before
+    ``at``, ties broken by ``created_at`` then ``price_version``.
+    """
+
+    eligible = [
+        entry
+        for entry in entries
+        if entry.meter == meter and entry.model_tier == model_tier and entry.effective_from <= at
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda entry: (entry.effective_from, entry.created_at, entry.price_version),
+    )
 
 
 def _platform_budget_limit_micros(values: Mapping[str, Any]) -> int | None:
