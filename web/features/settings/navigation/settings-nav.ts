@@ -67,6 +67,8 @@ export interface SettingsLeaf {
   service?: ServiceName;
   /** Hidden from non-admin users (the backend rejects them anyway). */
   adminOnly?: boolean;
+  /** Needs hosted commercial mode as a paying customer (admins manage directly). */
+  commercialOnly?: boolean;
 }
 
 export interface SettingsCategory {
@@ -89,7 +91,9 @@ export function isSettingsLeafVisible(
   leaf: SettingsLeaf,
   access: SettingsAccess,
 ): boolean {
-  return !(leaf.adminOnly && access.hideAdminOnly);
+  if (leaf.adminOnly && access.hideAdminOnly) return false;
+  if (leaf.commercialOnly && !access.showCommercialOnly) return false;
+  return true;
 }
 
 export function isSettingsCategoryVisible(

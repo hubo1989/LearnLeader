@@ -9,6 +9,7 @@ from .models import (
     BillingCustomer,
     Entitlement,
     PlanVersion,
+    PurchaseOrder,
     ReconciliationReport,
     Subscription,
     SubscriptionStatus,
@@ -33,6 +34,8 @@ class CommercialRepository(Protocol):
     ) -> PlanVersion: ...
 
     async def get_plan_version(self, plan_version_id: str) -> PlanVersion | None: ...
+
+    async def list_plan_versions(self) -> tuple[PlanVersion, ...]: ...
 
     async def list_entitlements(self, plan_version_id: str) -> tuple[Entitlement, ...]: ...
 
@@ -97,7 +100,15 @@ class CommercialRepository(Protocol):
         customer_id: str,
     ) -> tuple[UsageReservation, ...]: ...
 
-    async def list_usage_events(self, customer_id: str) -> tuple[UsageEvent, ...]: ...
+    async def list_usage_events(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[UsageEvent, ...]: ...
 
     async def finalize_usage(
         self,
@@ -114,5 +125,41 @@ class CommercialRepository(Protocol):
     ) -> UsageReservation: ...
 
     async def reconcile(self, at: datetime, *, repair: bool) -> ReconciliationReport: ...
+
+    async def create_order(self, candidate: PurchaseOrder) -> PurchaseOrder: ...
+
+    async def get_order(self, order_id: str) -> PurchaseOrder | None: ...
+
+    async def list_orders(
+        self,
+        customer_id: str,
+        *,
+        status: str | None = None,
+    ) -> tuple[PurchaseOrder, ...]: ...
+
+    async def list_all_orders(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[PurchaseOrder, ...]: ...
+
+    async def pay_and_fulfill_order(
+        self,
+        order_id: str,
+        subscription_candidate: Subscription | None,
+        changed_at: datetime,
+        *,
+        operator: str,
+        payment_reference: str | None = None,
+        extend_subscription_id: str | None = None,
+    ) -> tuple[PurchaseOrder, Subscription]: ...
+
+    async def cancel_order(
+        self,
+        order_id: str,
+        canceled_at: datetime,
+    ) -> PurchaseOrder: ...
 
     async def erase_customer(self, owner_id: str) -> bool: ...

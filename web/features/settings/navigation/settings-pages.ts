@@ -1,4 +1,4 @@
-import { Activity, Archive, BarChart3, Bot, Settings2 } from 'lucide-react'
+import { Activity, Archive, BarChart3, Bot, Receipt, Settings2 } from 'lucide-react'
 import {
   SETTINGS_CATEGORIES,
   isSettingsCategoryVisible,
@@ -11,7 +11,7 @@ import type { LucideIcon } from 'lucide-react'
 import type { SettingsAccess } from './settings-access'
 
 export const SETTINGS_PAGE_GROUPS: { label: Lang; keys: string[] }[] = [
-  { label: { en: 'Personal', zh: '个人' }, keys: ['general', 'workspace', 'data-migration', 'appearance', 'usage'] },
+  { label: { en: 'Personal', zh: '个人' }, keys: ['general', 'workspace', 'data-migration', 'appearance', 'usage', 'orders'] },
   {
     label: { en: 'Models & services', zh: '模型与服务' },
     keys: ['connections', 'llm', 'task-models', 'embedding', 'search', 'voice', 'multimodal', 'byok'],
@@ -83,6 +83,15 @@ const extraPages: SettingsLeaf[] = [
     icon: BarChart3,
     href: '/settings/usage',
     tile: '',
+  },
+  {
+    key: 'orders',
+    label: { en: 'Plans & orders', zh: '方案与订单' },
+    blurb: { en: 'Buy a plan offline and track your orders', zh: '线下购买方案并跟踪订单' },
+    icon: Receipt,
+    href: '/settings/orders',
+    tile: '',
+    commercialOnly: true,
   },
   {
     key: 'archive',

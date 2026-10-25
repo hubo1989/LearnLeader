@@ -14,7 +14,9 @@ from .errors import (
     EntitlementDenied,
     IdempotencyConflict,
     ImmutablePlanVersion,
+    InvalidOrderTransition,
     InvalidSubscriptionTransition,
+    PendingOrderExists,
     TrialAlreadyClaimed,
     UsageAmountExceeded,
 )
@@ -23,7 +25,9 @@ from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
     BillingCustomer,
     Entitlement,
+    OrderStatus,
     PlanVersion,
+    PurchaseOrder,
     ReconciliationFinding,
     ReconciliationReport,
     Subscription,
@@ -59,6 +63,9 @@ class InMemoryCommercialRepository:
         self._reservation_by_dedupe: dict[str, str] = {}
         self._usage_events: dict[str, UsageEvent] = {}
         self._usage_event_by_reservation: dict[str, str] = {}
+        self._orders: dict[str, PurchaseOrder] = {}
+        self._order_by_dedupe: dict[str, str] = {}
+        self._order_by_external: dict[tuple[str, str], str] = {}
 
     async def ensure_billing_customer(self, candidate: BillingCustomer) -> BillingCustomer:
         async with self._lock:
@@ -148,6 +155,15 @@ class InMemoryCommercialRepository:
     async def get_plan_version(self, plan_version_id: str) -> PlanVersion | None:
         async with self._lock:
             return self._plans.get(plan_version_id)
+
+    async def list_plan_versions(self) -> tuple[PlanVersion, ...]:
+        async with self._lock:
+            return tuple(
+                sorted(
+                    self._plans.values(),
+                    key=lambda item: (item.plan_code, item.version),
+                )
+            )
 
     async def list_entitlements(self, plan_version_id: str) -> tuple[Entitlement, ...]:
         async with self._lock:
@@ -505,18 +521,29 @@ class InMemoryCommercialRepository:
                 )
             )
 
-    async def list_usage_events(self, customer_id: str) -> tuple[UsageEvent, ...]:
+    async def list_usage_events(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[UsageEvent, ...]:
         async with self._lock:
-            return tuple(
-                sorted(
-                    (
-                        item
-                        for item in self._usage_events.values()
-                        if item.customer_id == customer_id
-                    ),
-                    key=lambda item: (item.created_at, item.id),
-                )
+            selected = sorted(
+                (
+                    item
+                    for item in self._usage_events.values()
+                    if item.customer_id == customer_id
+                    and (since is None or item.occurred_at >= since)
+                    and (until is None or item.occurred_at < until)
+                    and (meter is None or item.meter == meter)
+                ),
+                key=lambda item: (item.occurred_at, item.id),
+                reverse=True,
             )
+            return tuple(selected[:limit] if limit is not None else selected)
 
     async def finalize_usage(
         self,
@@ -627,6 +654,227 @@ class InMemoryCommercialRepository:
                 repaired=repaired,
             )
 
+    async def create_order(self, candidate: PurchaseOrder) -> PurchaseOrder:
+        async with self._lock:
+            self._require_customer(candidate.customer_id)
+            self._require_plan(candidate.plan_version_id)
+            existing_id = self._order_by_dedupe.get(candidate.dedupe_key)
+            if existing_id is not None:
+                existing = self._orders[existing_id]
+                if not self._same_order_identity(existing, candidate):
+                    raise IdempotencyConflict(
+                        "order idempotency key was replayed with different semantics"
+                    )
+                return existing
+            if candidate.id in self._orders:
+                raise CommercialConflict(f"purchase order id already exists: {candidate.id}")
+            if candidate.external_order_id:
+                external_key = (candidate.provider, candidate.external_order_id)
+                if external_key in self._order_by_external:
+                    raise CommercialConflict("external order id already exists for this provider")
+            for order in self._orders.values():
+                if (
+                    order.customer_id == candidate.customer_id
+                    and order.status is OrderStatus.PENDING_PAYMENT
+                ):
+                    raise PendingOrderExists(
+                        "cancel or fulfill the open order before creating another"
+                    )
+            self._orders[candidate.id] = candidate
+            self._order_by_dedupe[candidate.dedupe_key] = candidate.id
+            if candidate.external_order_id:
+                self._order_by_external[(candidate.provider, candidate.external_order_id)] = (
+                    candidate.id
+                )
+            return candidate
+
+    async def get_order(self, order_id: str) -> PurchaseOrder | None:
+        async with self._lock:
+            return self._orders.get(order_id)
+
+    async def list_orders(
+        self,
+        customer_id: str,
+        *,
+        status: str | None = None,
+    ) -> tuple[PurchaseOrder, ...]:
+        async with self._lock:
+            orders = [
+                order
+                for order in self._orders.values()
+                if order.customer_id == customer_id
+                and (status is None or order.status.value == status)
+            ]
+            return tuple(sorted(orders, key=lambda item: (item.created_at, item.id)))
+
+    async def list_all_orders(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[PurchaseOrder, ...]:
+        async with self._lock:
+            orders = sorted(
+                (
+                    order
+                    for order in self._orders.values()
+                    if status is None or order.status.value == status
+                ),
+                key=lambda item: (item.created_at, item.id),
+                reverse=True,
+            )
+            return tuple(orders[max(0, offset) : max(0, offset) + max(1, limit)])
+
+    async def pay_and_fulfill_order(
+        self,
+        order_id: str,
+        subscription_candidate: Subscription | None,
+        changed_at: datetime,
+        *,
+        operator: str,
+        payment_reference: str | None = None,
+        extend_subscription_id: str | None = None,
+    ) -> tuple[PurchaseOrder, Subscription]:
+        async with self._lock:
+            order = self._require_order(order_id)
+            if order.status is OrderStatus.FULFILLED:
+                subscription = self._subscriptions.get(order.subscription_id or "")
+                if subscription is None:
+                    raise CommercialConflict("fulfilled order lost its subscription")
+                return order, subscription
+            if order.status not in {OrderStatus.PENDING_PAYMENT, OrderStatus.PAID}:
+                raise InvalidOrderTransition(
+                    f"order in status {order.status.value} cannot be fulfilled"
+                )
+            if extend_subscription_id is not None:
+                # Early renewal: extend the live subscription instead of
+                # replacing it, so paid time is never interrupted.
+                live = self._subscriptions.get(extend_subscription_id)
+                if live is None or live.status not in {
+                    SubscriptionStatus.TRIALING,
+                    SubscriptionStatus.ACTIVE,
+                    SubscriptionStatus.PAST_DUE,
+                }:
+                    raise CommercialConflict("renewal target subscription is not live anymore")
+                if order.period_end <= live.current_period_end:
+                    raise CommercialConflict("renewal order does not extend the live period")
+                activated = replace(
+                    live,
+                    current_period_end=order.period_end,
+                    version=live.version + 1,
+                    updated_at=changed_at,
+                )
+                self._subscriptions[live.id] = activated
+            else:
+                assert subscription_candidate is not None
+                # The activation below deduplicates on the order's external
+                # subscription id, so a concurrent retry converges on one row.
+                activated = self._activate_subscription_locked(
+                    subscription_candidate,
+                    changed_at,
+                )
+            metadata = dict(thaw_json(order.metadata) or {})
+            metadata["fulfilled_by"] = operator
+            if payment_reference:
+                metadata["payment_reference"] = payment_reference
+            updated = replace(
+                order,
+                status=OrderStatus.FULFILLED,
+                paid_at=order.paid_at or changed_at,
+                fulfilled_at=changed_at,
+                subscription_id=activated.id,
+                metadata=metadata,
+                updated_at=changed_at,
+            )
+            self._orders[order.id] = updated
+            return updated, activated
+
+    def _activate_subscription_locked(
+        self,
+        candidate: Subscription,
+        changed_at: datetime,
+    ) -> Subscription:
+        """In-lock, in-memory variant of ``activate_paid_subscription``."""
+
+        if candidate.external_subscription_id:
+            key = (candidate.provider, candidate.external_subscription_id)
+            existing_id = self._subscription_by_external.get(key)
+            if existing_id is not None:
+                existing = self._subscriptions[existing_id]
+                if not self._same_subscription_identity(existing, candidate):
+                    raise IdempotencyConflict(
+                        "external subscription id was reused with different semantics"
+                    )
+                return existing
+        for subscription in tuple(self._subscriptions.values()):
+            if subscription.customer_id != candidate.customer_id:
+                continue
+            if subscription.status in {
+                SubscriptionStatus.TRIALING,
+                SubscriptionStatus.ACTIVE,
+                SubscriptionStatus.PAST_DUE,
+            }:
+                self._subscriptions[subscription.id] = replace(
+                    subscription,
+                    status=SubscriptionStatus.CANCELED,
+                    canceled_at=changed_at,
+                    version=subscription.version + 1,
+                    updated_at=changed_at,
+                )
+        self._subscriptions[candidate.id] = candidate
+        if candidate.external_subscription_id:
+            self._subscription_by_external[
+                (candidate.provider, candidate.external_subscription_id)
+            ] = candidate.id
+        return candidate
+
+    async def cancel_order(
+        self,
+        order_id: str,
+        canceled_at: datetime,
+    ) -> PurchaseOrder:
+        async with self._lock:
+            order = self._require_order(order_id)
+            if order.status is OrderStatus.CANCELED:
+                return order
+            if order.status is not OrderStatus.PENDING_PAYMENT:
+                raise InvalidOrderTransition(
+                    f"order in status {order.status.value} cannot be canceled"
+                )
+            updated = replace(
+                order,
+                status=OrderStatus.CANCELED,
+                canceled_at=canceled_at,
+                updated_at=canceled_at,
+            )
+            self._orders[order.id] = updated
+            return updated
+
+    def _require_order(self, order_id: str) -> PurchaseOrder:
+        order = self._orders.get(order_id)
+        if order is None:
+            raise CommercialNotFound(f"purchase order not found: {order_id}")
+        return order
+
+    @staticmethod
+    def _same_order_identity(existing: PurchaseOrder, candidate: PurchaseOrder) -> bool:
+        return (
+            existing.customer_id,
+            existing.plan_version_id,
+            existing.order_type,
+            existing.price_minor,
+            existing.currency,
+            existing.provider,
+        ) == (
+            candidate.customer_id,
+            candidate.plan_version_id,
+            candidate.order_type,
+            candidate.price_minor,
+            candidate.currency,
+            candidate.provider,
+        )
+
     async def erase_customer(self, owner_id: str) -> bool:
         async with self._lock:
             customer_id = self._customer_by_owner.get(owner_id)
@@ -658,6 +906,15 @@ class InMemoryCommercialRepository:
                 if webhook.customer_id == customer_id:
                     self._webhooks.pop(webhook_id)
                     self._webhook_by_dedupe.pop(webhook.dedupe_key, None)
+            for order_id, order in tuple(self._orders.items()):
+                if order.customer_id == customer_id:
+                    self._orders.pop(order_id)
+                    self._order_by_dedupe.pop(order.dedupe_key, None)
+                    if order.external_order_id:
+                        self._order_by_external.pop(
+                            (order.provider, order.external_order_id),
+                            None,
+                        )
             self._customers.pop(customer_id)
             self._customer_by_owner.pop(owner_id, None)
             return True

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 from typing import Mapping
@@ -14,11 +16,15 @@ from .postgres import PostgresCommercialRepository
 from .seed import TrialV1ModelBinding, seed_trial_v1
 from .service import DEFAULT_TRIAL_DAYS, CommercialControlPlane
 
+logger = logging.getLogger(__name__)
+
 COMMERCIAL_ENABLED_ENV = "DEEPTUTOR_COMMERCIAL_ENABLED"
 COMMERCIAL_DATABASE_URL_ENV = "DEEPTUTOR_COMMERCIAL_DATABASE_URL"
 COMMERCIAL_DATABASE_URL_FILE_ENV = "DEEPTUTOR_COMMERCIAL_DATABASE_URL_FILE"
 COMMERCIAL_TRIAL_DAYS_ENV = "DEEPTUTOR_COMMERCIAL_TRIAL_DAYS"
 COMMERCIAL_TRIAL_LLM_MODELS_ENV = "DEEPTUTOR_COMMERCIAL_TRIAL_LLM_MODELS"
+COMMERCIAL_RECONCILE_INTERVAL_ENV = "DEEPTUTOR_COMMERCIAL_RECONCILE_INTERVAL_SECONDS"
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +33,7 @@ class CommercialSettings:
     database_url: str | None = None
     trial_days: int = DEFAULT_TRIAL_DAYS
     trial_model_binding: TrialV1ModelBinding | None = None
+    reconcile_interval_seconds: float = DEFAULT_RECONCILE_INTERVAL_SECONDS
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "CommercialSettings":
@@ -66,6 +73,19 @@ class CommercialSettings:
             )
         raw_models = values.get(COMMERCIAL_TRIAL_LLM_MODELS_ENV, "").strip()
         model_binding = TrialV1ModelBinding.from_json(raw_models) if raw_models else None
+        raw_interval = values.get(COMMERCIAL_RECONCILE_INTERVAL_ENV, "").strip()
+        reconcile_interval_seconds = DEFAULT_RECONCILE_INTERVAL_SECONDS
+        if raw_interval:
+            try:
+                reconcile_interval_seconds = float(raw_interval)
+            except ValueError as exc:
+                raise CommercialConfigurationError(
+                    f"{COMMERCIAL_RECONCILE_INTERVAL_ENV} must be a number of seconds"
+                ) from exc
+            if reconcile_interval_seconds < 0:
+                raise CommercialConfigurationError(
+                    f"{COMMERCIAL_RECONCILE_INTERVAL_ENV} must not be negative; use 0 to disable"
+                )
         if enabled and not database_url:
             raise CommercialConfigurationError(
                 "commercial mode is enabled but DEEPTUTOR_COMMERCIAL_DATABASE_URL "
@@ -81,6 +101,7 @@ class CommercialSettings:
             database_url=database_url,
             trial_days=trial_days,
             trial_model_binding=model_binding,
+            reconcile_interval_seconds=reconcile_interval_seconds,
         )
 
 
@@ -101,6 +122,7 @@ class CommercialRuntime:
         self.control_plane: CommercialControlPlane | None = None
         self.trial_plan: PlanVersion | None = None
         self._lock = asyncio.Lock()
+        self._janitor_task: asyncio.Task[None] | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "CommercialRuntime":
@@ -130,16 +152,60 @@ class CommercialRuntime:
                 raise
             self.repository = repository
             self.control_plane = control_plane
+            if self.settings.reconcile_interval_seconds > 0:
+                self._janitor_task = asyncio.create_task(
+                    self._reconcile_janitor_loop(),
+                    name="commercial-reconcile-janitor",
+                )
             return control_plane
+
+    async def run_reconcile_sweep(self) -> None:
+        """Apply deterministic repair to expired trials and leaked reservations.
+
+        Expiry (`expires_at`) already protects quota accounting, but nothing
+        materializes that protection: without this sweep, stale reservations
+        keep inflating ``usage_summary``'s held totals and trialing
+        subscriptions linger past their end. Failures are logged, not raised,
+        so one bad sweep never takes the process down.
+        """
+
+        control_plane = self.control_plane
+        if control_plane is None:
+            return
+        try:
+            report = await control_plane.reconcile(repair=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("commercial reconcile sweep failed")
+            return
+        if report.findings:
+            logger.info(
+                "commercial reconcile sweep: %d findings, %d repaired",
+                len(report.findings),
+                report.repaired,
+            )
+
+    async def _reconcile_janitor_loop(self) -> None:
+        interval = self.settings.reconcile_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            await self.run_reconcile_sweep()
 
     async def shutdown(self) -> None:
         async with self._lock:
+            janitor = self._janitor_task
+            self._janitor_task = None
             repository = self.repository
             self.repository = None
             self.control_plane = None
             self.trial_plan = None
-            if repository is not None:
-                await repository.close()
+        if janitor is not None:
+            janitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await janitor
+        if repository is not None:
+            await repository.close()
 
     @property
     def trial_plan_version_id(self) -> str | None:

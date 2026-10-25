@@ -614,8 +614,10 @@ from deeptutor.api.routers import (
 from deeptutor.api.routers import (
     tools as tools_router,
 )
+from deeptutor.api.routers.auth import require_admin  # noqa: E402
 from deeptutor.api.routers.file_library import router as file_library_router  # noqa: E402
 from deeptutor.api.routers.multi_user import router as multi_user_router  # noqa: E402
+from deeptutor.commercial.admin_api import router as commercial_admin_router  # noqa: E402
 from deeptutor.commercial.api import router as commercial_router  # noqa: E402
 
 # Auth router is public — login/logout/register/status require no token
@@ -624,6 +626,15 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 # its own require_commercial_access dependency, which no-ops while commercial
 # mode is disabled, so mounting here stays safe for local single-user runs.
 app.include_router(commercial_router, prefix="/api/v1", tags=["commercial"])
+# Admin commercial surface (order fulfillment, plan publishing, cross-user
+# usage reads). require_admin enforces role checks; while commercial mode is
+# disabled every endpoint returns 404 before touching any state.
+app.include_router(
+    commercial_admin_router,
+    prefix="/api/v1",
+    tags=["commercial"],
+    dependencies=[Depends(require_admin)],
+)
 app.include_router(outputs.router, prefix="/files/outputs", tags=["outputs"])
 app.include_router(
     workspace.files_router,

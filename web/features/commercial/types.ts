@@ -29,3 +29,42 @@ export type CommercialAccessSnapshot = {
   /** Per-meter usage; absent on older payloads. */
   usage: Record<string, CommercialMeterUsage>
 }
+
+/** One published plan version with its price. */
+export type CommercialPlan = {
+  id: string
+  planCode: string
+  version: number
+  name: string
+  priceMinor: number
+  currency: string
+  billingInterval: string
+  trialDays: number
+}
+
+export const COMMERCIAL_ORDER_STATUSES = [
+  'pending_payment',
+  'paid',
+  'fulfilled',
+  'canceled',
+  'refunded',
+] as const
+
+export type CommercialOrderStatus = (typeof COMMERCIAL_ORDER_STATUSES)[number]
+
+/** A purchase order snapshotted at creation (price and period included). */
+export type CommercialOrder = {
+  id: string
+  orderType: 'subscription_new' | 'subscription_renew'
+  planVersionId: string
+  priceMinor: number
+  currency: string
+  status: CommercialOrderStatus
+  periodStart: string
+  periodEnd: string
+  paidAt: string | null
+  fulfilledAt: string | null
+  canceledAt: string | null
+  subscriptionId: string | null
+  createdAt: string
+}

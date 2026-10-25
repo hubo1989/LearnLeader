@@ -17,6 +17,7 @@ const admin = {
   hideAdminOnly: false,
   showLearnerOnly: false,
   showGuardianOnly: false,
+  showCommercialOnly: false,
 };
 
 test("legacy settings bookmarks resolve to independent pages, preserving profile links", () => {
@@ -55,6 +56,7 @@ test("every available setting is reachable through a navigation family", () => {
     ...admin,
     showLearnerOnly: true,
     showGuardianOnly: true,
+    showCommercialOnly: false,
   })) {
     assert.ok(reachable.has(page.key), page.key);
   }

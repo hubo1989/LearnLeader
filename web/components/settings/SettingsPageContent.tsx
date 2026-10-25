@@ -24,6 +24,7 @@ const loading = () => (
 );
 const General = dynamic(() => import("./SettingsOverview"), { loading });
 const Usage = dynamic(() => import("@/features/settings/sections/UsageSettingsSection"), { loading });
+const Orders = dynamic(() => import("@/features/commercial/OrdersSection"), { loading });
 const DataMigration = dynamic(() => import("@/features/settings/sections/DataMigrationSettingsSection"), { loading });
 const Status = dynamic(() => import("./SettingsRuntimePage"), { loading });
 const Appearance = dynamic(
@@ -180,6 +181,7 @@ const PAGES: Record<string, React.ComponentType> = {
   general: General,
   status: Status,
   usage: Usage,
+  orders: Orders,
   appearance: Appearance,
   network: Network,
   workspace: Workspace,

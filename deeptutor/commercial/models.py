@@ -31,6 +31,32 @@ class UsageReservationState(str, Enum):
     RELEASED = "released"
 
 
+class OrderStatus(str, Enum):
+    PENDING_PAYMENT = "pending_payment"
+    PAID = "paid"
+    FULFILLED = "fulfilled"
+    CANCELED = "canceled"
+    REFUNDED = "refunded"
+
+
+class OrderType(str, Enum):
+    SUBSCRIPTION_NEW = "subscription_new"
+    SUBSCRIPTION_RENEW = "subscription_renew"
+
+
+ALLOWED_ORDER_TRANSITIONS: Mapping[OrderStatus, frozenset[OrderStatus]] = {
+    # ``fulfilled`` is reachable straight from pending_payment: manual
+    # mark-paid fulfillment lands both transitions in one transaction.
+    OrderStatus.PENDING_PAYMENT: frozenset(
+        {OrderStatus.PAID, OrderStatus.FULFILLED, OrderStatus.CANCELED}
+    ),
+    OrderStatus.PAID: frozenset({OrderStatus.FULFILLED, OrderStatus.REFUNDED}),
+    OrderStatus.FULFILLED: frozenset(),
+    OrderStatus.CANCELED: frozenset(),
+    OrderStatus.REFUNDED: frozenset(),
+}
+
+
 class QuotaWindow(str, Enum):
     UTC_DAY = "utc_day"
     SUBSCRIPTION = "subscription"
@@ -142,6 +168,42 @@ class WebhookEvent:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", freeze_json(self.payload))
+
+
+@dataclass(frozen=True, slots=True)
+class PurchaseOrder:
+    """A purchase intent with its price and period snapshotted at creation.
+
+    Payment capture is deliberately decoupled: today an administrator moves a
+    pending order to paid/fulfilled manually after offline collection; a
+    future payment gateway does the same through the webhook inbox. Either
+    way, fulfillment replaces effective access through the same atomic
+    activate path a verified provider subscription uses.
+    """
+
+    id: str
+    dedupe_key: str
+    customer_id: str
+    plan_version_id: str
+    order_type: OrderType
+    price_minor: int
+    currency: str
+    status: OrderStatus
+    provider: str
+    external_order_id: str | None
+    subscription_id: str | None
+    period_start: datetime
+    period_end: datetime
+    paid_at: datetime | None
+    fulfilled_at: datetime | None
+    canceled_at: datetime | None
+    refunded_at: datetime | None
+    metadata: Any
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", freeze_json(self.metadata))
 
 
 @dataclass(frozen=True, slots=True)

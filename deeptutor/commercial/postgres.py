@@ -19,8 +19,10 @@ from .errors import (
     EntitlementDenied,
     IdempotencyConflict,
     ImmutablePlanVersion,
+    InvalidOrderTransition,
     InvalidSubscriptionTransition,
     MigrationDriftError,
+    PendingOrderExists,
     TrialAlreadyClaimed,
     UsageAmountExceeded,
 )
@@ -30,7 +32,10 @@ from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
     BillingCustomer,
     Entitlement,
+    OrderStatus,
+    OrderType,
     PlanVersion,
+    PurchaseOrder,
     ReconciliationFinding,
     ReconciliationReport,
     Subscription,
@@ -274,6 +279,16 @@ class PostgresCommercialRepository:
                 plan_version_id,
             )
         return _plan_version(row) if row is not None else None
+
+    async def list_plan_versions(self) -> tuple[PlanVersion, ...]:
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT * FROM commercial.plan_version
+                ORDER BY plan_code, version
+                """
+            )
+        return tuple(_plan_version(row) for row in rows)
 
     async def list_entitlements(self, plan_version_id: str) -> tuple[Entitlement, ...]:
         async with self._connection() as connection:
@@ -799,14 +814,32 @@ class PostgresCommercialRepository:
             )
         return tuple(_reservation(row) for row in rows)
 
-    async def list_usage_events(self, customer_id: str) -> tuple[UsageEvent, ...]:
+    async def list_usage_events(
+        self,
+        customer_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        meter: str | None = None,
+        limit: int | None = None,
+    ) -> tuple[UsageEvent, ...]:
+        # Filters are pushed down so a long-lived ledger never fully loads.
         async with self._connection() as connection:
             rows = await connection.fetch(
                 """
                 SELECT * FROM commercial.usage_event
-                WHERE customer_id = $1 ORDER BY created_at, id
+                WHERE customer_id = $1
+                  AND ($2::timestamptz IS NULL OR occurred_at >= $2)
+                  AND ($3::timestamptz IS NULL OR occurred_at < $3)
+                  AND ($4::text IS NULL OR meter = $4)
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT $5
                 """,
                 customer_id,
+                since,
+                until,
+                meter,
+                limit if limit is not None else 2**31 - 1,
             )
         return tuple(_usage_event(row) for row in rows)
 
@@ -990,6 +1023,246 @@ class PostgresCommercialRepository:
                 repaired=repaired,
             )
 
+    async def create_order(self, candidate: PurchaseOrder) -> PurchaseOrder:
+        async with self._connection() as connection, connection.transaction():
+            existing_row = await connection.fetchrow(
+                "SELECT * FROM commercial.purchase_order WHERE dedupe_key = $1",
+                candidate.dedupe_key,
+            )
+            if existing_row is not None:
+                existing = _order(existing_row)
+                if not _same_order_identity(existing, candidate):
+                    raise IdempotencyConflict(
+                        "order idempotency key was replayed with different semantics"
+                    )
+                return existing
+            pending = await connection.fetchval(
+                """
+                SELECT id FROM commercial.purchase_order
+                WHERE customer_id = $1 AND status = 'pending_payment'
+                """,
+                candidate.customer_id,
+            )
+            if pending is not None:
+                raise PendingOrderExists("cancel or fulfill the open order before creating another")
+            await connection.execute(
+                """
+                INSERT INTO commercial.purchase_order (
+                    id, dedupe_key, customer_id, plan_version_id, order_type,
+                    price_minor, currency, status, provider, external_order_id,
+                    subscription_id, period_start, period_end, paid_at,
+                    fulfilled_at, canceled_at, refunded_at, metadata_json,
+                    created_at, updated_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    NULL, $11, $12, NULL, NULL, NULL, NULL, $13, $14, $15
+                )
+                """,
+                candidate.id,
+                candidate.dedupe_key,
+                candidate.customer_id,
+                candidate.plan_version_id,
+                candidate.order_type.value,
+                candidate.price_minor,
+                candidate.currency,
+                candidate.status.value,
+                candidate.provider,
+                candidate.external_order_id,
+                candidate.period_start,
+                candidate.period_end,
+                json.dumps(thaw_json(candidate.metadata)),
+                candidate.created_at,
+                candidate.updated_at,
+            )
+            return candidate
+
+    async def get_order(self, order_id: str) -> PurchaseOrder | None:
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                "SELECT * FROM commercial.purchase_order WHERE id = $1",
+                order_id,
+            )
+        return _order(row) if row is not None else None
+
+    async def list_orders(
+        self,
+        customer_id: str,
+        *,
+        status: str | None = None,
+    ) -> tuple[PurchaseOrder, ...]:
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT * FROM commercial.purchase_order
+                WHERE customer_id = $1
+                  AND ($2::text IS NULL OR status = $2)
+                ORDER BY created_at, id
+                """,
+                customer_id,
+                status,
+            )
+        return tuple(_order(row) for row in rows)
+
+    async def list_all_orders(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[PurchaseOrder, ...]:
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT * FROM commercial.purchase_order
+                WHERE ($1::text IS NULL OR status = $1)
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2 OFFSET $3
+                """,
+                status,
+                max(1, limit),
+                max(0, offset),
+            )
+        return tuple(_order(row) for row in rows)
+
+    async def pay_and_fulfill_order(
+        self,
+        order_id: str,
+        subscription_candidate: Subscription | None,
+        changed_at: datetime,
+        *,
+        operator: str,
+        payment_reference: str | None = None,
+        extend_subscription_id: str | None = None,
+    ) -> tuple[PurchaseOrder, Subscription]:
+        async with self._connection() as connection, connection.transaction():
+            order_row = await connection.fetchrow(
+                "SELECT * FROM commercial.purchase_order WHERE id = $1 FOR UPDATE",
+                order_id,
+            )
+            if order_row is None:
+                raise CommercialNotFound(f"purchase order not found: {order_id}")
+            order = _order(order_row)
+            if order.status is OrderStatus.FULFILLED:
+                subscription_row = await connection.fetchrow(
+                    "SELECT * FROM commercial.subscription WHERE id = $1",
+                    order.subscription_id,
+                )
+                if subscription_row is None:
+                    raise CommercialConflict("fulfilled order lost its subscription")
+                return order, _subscription(subscription_row)
+            if order.status not in {OrderStatus.PENDING_PAYMENT, OrderStatus.PAID}:
+                raise InvalidOrderTransition(
+                    f"order in status {order.status.value} cannot be fulfilled"
+                )
+            if extend_subscription_id is not None:
+                # Early renewal: extend the live subscription instead of
+                # replacing it, so paid time is never interrupted.
+                extended_row = await connection.fetchrow(
+                    """
+                    UPDATE commercial.subscription
+                    SET current_period_end = $2, version = version + 1,
+                        updated_at = $3
+                    WHERE id = $1
+                      AND status IN ('trialing', 'active', 'past_due')
+                      AND current_period_end < $2
+                    RETURNING *
+                    """,
+                    extend_subscription_id,
+                    order.period_end,
+                    changed_at,
+                )
+                if extended_row is None:
+                    raise CommercialConflict(
+                        "renewal target subscription is not live or not extended"
+                    )
+                subscription = _subscription(extended_row)
+            else:
+                assert subscription_candidate is not None
+                # Same replacement semantics as activate_paid_subscription,
+                # keyed to the order id so a retried fulfillment converges.
+                existing_row = await connection.fetchrow(
+                    """
+                    SELECT * FROM commercial.subscription
+                    WHERE provider = $1 AND external_subscription_id = $2
+                    """,
+                    subscription_candidate.provider,
+                    subscription_candidate.external_subscription_id,
+                )
+                if existing_row is not None:
+                    existing = _subscription(existing_row)
+                    if not _same_subscription_identity(existing, subscription_candidate):
+                        raise IdempotencyConflict(
+                            "external subscription id was reused with different semantics"
+                        )
+                    subscription = existing
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE commercial.subscription
+                        SET status = 'canceled', canceled_at = $2,
+                            version = version + 1, updated_at = $2
+                        WHERE customer_id = $1
+                          AND status IN ('trialing', 'active', 'past_due')
+                        """,
+                        order.customer_id,
+                        changed_at,
+                    )
+                    try:
+                        await self._insert_subscription(connection, subscription_candidate)
+                    except Exception as exc:
+                        _raise_subscription_conflict(exc)
+                    subscription = subscription_candidate
+            metadata = dict(thaw_json(order.metadata) or {})
+            metadata["fulfilled_by"] = operator
+            if payment_reference:
+                metadata["payment_reference"] = payment_reference
+            updated_row = await connection.fetchrow(
+                """
+                UPDATE commercial.purchase_order
+                SET status = 'fulfilled', paid_at = COALESCE(paid_at, $2),
+                    fulfilled_at = $2, subscription_id = $3,
+                    metadata_json = $4, updated_at = $2
+                WHERE id = $1
+                RETURNING *
+                """,
+                order.id,
+                changed_at,
+                subscription.id,
+                json.dumps(metadata),
+            )
+            return _order(updated_row), subscription
+
+    async def cancel_order(
+        self,
+        order_id: str,
+        canceled_at: datetime,
+    ) -> PurchaseOrder:
+        async with self._connection() as connection, connection.transaction():
+            order_row = await connection.fetchrow(
+                "SELECT * FROM commercial.purchase_order WHERE id = $1 FOR UPDATE",
+                order_id,
+            )
+            if order_row is None:
+                raise CommercialNotFound(f"purchase order not found: {order_id}")
+            order = _order(order_row)
+            if order.status is OrderStatus.CANCELED:
+                return order
+            if order.status is not OrderStatus.PENDING_PAYMENT:
+                raise InvalidOrderTransition(
+                    f"order in status {order.status.value} cannot be canceled"
+                )
+            updated_row = await connection.fetchrow(
+                """
+                UPDATE commercial.purchase_order
+                SET status = 'canceled', canceled_at = $2, updated_at = $2
+                WHERE id = $1
+                RETURNING *
+                """,
+                order_id,
+                canceled_at,
+            )
+            return _order(updated_row)
+
     async def erase_customer(self, owner_id: str) -> bool:
         async with self._connection() as connection, connection.transaction():
             customer_id = await connection.fetchval(
@@ -1016,6 +1289,14 @@ class PostgresCommercialRepository:
             )
             await connection.execute(
                 "DELETE FROM commercial.usage_reservation WHERE customer_id = $1",
+                customer_id,
+            )
+            # The order→subscription FK is deferrable: deleting orders
+            # before subscriptions satisfies it at commit, and nulling
+            # subscription_id instead would violate the fulfilled-shape
+            # check (checks are NOT deferrable).
+            await connection.execute(
+                "DELETE FROM commercial.purchase_order WHERE customer_id = $1",
                 customer_id,
             )
             await connection.execute(
@@ -1082,6 +1363,49 @@ def _subscription(row: Any) -> Subscription:
         version=row["version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _order(row: Any) -> PurchaseOrder:
+    return PurchaseOrder(
+        id=row["id"],
+        dedupe_key=row["dedupe_key"].strip(),
+        customer_id=row["customer_id"],
+        plan_version_id=row["plan_version_id"],
+        order_type=OrderType(row["order_type"]),
+        price_minor=row["price_minor"],
+        currency=row["currency"],
+        status=OrderStatus(row["status"]),
+        provider=row["provider"],
+        external_order_id=row["external_order_id"],
+        subscription_id=row["subscription_id"],
+        period_start=row["period_start"],
+        period_end=row["period_end"],
+        paid_at=row["paid_at"],
+        fulfilled_at=row["fulfilled_at"],
+        canceled_at=row["canceled_at"],
+        refunded_at=row["refunded_at"],
+        metadata=_decode_json(row["metadata_json"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _same_order_identity(existing: PurchaseOrder, candidate: PurchaseOrder) -> bool:
+    return (
+        existing.customer_id,
+        existing.plan_version_id,
+        existing.order_type,
+        existing.price_minor,
+        existing.currency,
+        existing.provider,
+    ) == (
+        candidate.customer_id,
+        candidate.plan_version_id,
+        candidate.order_type,
+        candidate.price_minor,
+        candidate.currency,
+        candidate.provider,
     )
 
 

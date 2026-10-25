@@ -14,7 +14,7 @@ from deeptutor.commercial.postgres import AsyncpgUnavailable, PostgresCommercial
 
 def test_initial_postgres_migration_defines_all_control_plane_tables_and_guards() -> None:
     migrations = discover_migrations()
-    assert [migration.version for migration in migrations] == [1]
+    assert [migration.version for migration in migrations] == [1, 2]
     sql = migrations[0].sql.lower()
 
     for table in (
@@ -49,6 +49,20 @@ def test_migration_discovery_rejects_duplicate_versions(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="duplicate migration version"):
         discover_migrations(tmp_path)
+
+
+def test_orders_migration_defines_purchase_order_state_machine() -> None:
+    migrations = discover_migrations()
+    sql = migrations[1].sql.lower()
+
+    assert "table if not exists commercial.purchase_order" in sql
+    assert "purchase_order_one_pending_uidx" in sql
+    assert "purchase_order_provider_external_uidx" in sql
+    assert "validate_purchase_order_transition" in sql
+    # pending_payment → paid | fulfilled | canceled; paid → fulfilled | refunded.
+    assert "new.status in ('paid', 'fulfilled', 'canceled')" in sql
+    assert "old.status = 'paid' and new.status in ('fulfilled', 'refunded')" in sql
+    assert "price_minor" in sql and "period_end > period_start" in sql
 
 
 @pytest.mark.asyncio

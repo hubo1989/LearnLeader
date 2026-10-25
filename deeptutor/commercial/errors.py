@@ -35,6 +35,14 @@ class InvalidSubscriptionTransition(CommercialConflict):
     """A subscription status transition is not part of the state machine."""
 
 
+class InvalidOrderTransition(CommercialConflict):
+    """A purchase-order status transition is not part of the state machine."""
+
+
+class PendingOrderExists(CommercialConflict):
+    """The customer already has an open order awaiting payment."""
+
+
 class IdempotencyConflict(CommercialConflict):
     """A deduplication key was reused for different semantics."""
 
