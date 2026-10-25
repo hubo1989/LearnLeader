@@ -49,16 +49,18 @@ def test_reconcile_interval_rejects_garbage_and_negative():
 
 @dataclass
 class _RecordingControlPlane:
-    calls: list[tuple[datetime, bool]] = field(default_factory=list)
+    calls: list[bool] = field(default_factory=list)
     error: Exception | None = None
 
-    async def reconcile(self, at: datetime, *, repair: bool):
-        self.calls.append((at, repair))
+    async def reconcile(self, *, repair: bool = False):
+        # Mirrors CommercialControlPlane.reconcile's keyword-only signature:
+        # a stub accepting (at, repair) would hide caller signature drift.
+        self.calls.append(repair)
         if self.error is not None:
             raise self.error
         from deeptutor.commercial.models import ReconciliationReport
 
-        return ReconciliationReport(checked_at=at, findings=(), repaired=0)
+        return ReconciliationReport(checked_at=datetime.now(timezone.utc), findings=(), repaired=0)
 
 
 def _runtime_with(interval: float) -> CommercialRuntime:
@@ -81,10 +83,64 @@ async def test_sweep_applies_repair_with_utc_clock():
 
     await runtime.run_reconcile_sweep()
 
-    assert len(control_plane.calls) == 1
-    at, repair = control_plane.calls[0]
-    assert repair is True
-    assert at.tzinfo is not None
+    assert control_plane.calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_sweep_repairs_stale_state_through_the_real_control_plane():
+    """The sweep must call the control plane's actual signature.
+
+    The recording-stub test above cannot catch a signature mismatch — the
+    stub mirrors whatever the caller passes. This one exercises a real
+    CommercialControlPlane: a leaked reservation and an expired trial must
+    both be repaired by one sweep.
+    """
+
+    from deeptutor.commercial import CommercialControlPlane, InMemoryCommercialRepository
+    from deeptutor.commercial.models import (
+        SubscriptionStatus,
+        UsageReservationState,
+    )
+
+    repository = InMemoryCommercialRepository()
+    service = CommercialControlPlane(repository)
+    runtime = _runtime_with(300.0)
+    runtime.control_plane = service  # type: ignore[assignment]
+
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    customer = await service.ensure_billing_customer(owner_id="u_janitor")
+    plan = await service.publish_plan_version(
+        plan_code="pro",
+        version=1,
+        name="Pro",
+        price_minor=100,
+        currency="CNY",
+        entitlements={"quota.llm_tokens": {"limit": 100, "window": "subscription"}},
+    )
+    trial = await service.ensure_trial(customer.id, plan.id)
+    # Reserve while the trial is still entitled, then age both past expiry.
+    reservation = await service.reserve_usage(customer.id, "llm_tokens", 10, "janitor-stale-1")
+    async with repository._lock:
+        repository._subscriptions[trial.id] = replace(
+            trial,
+            trial_ends_at=now - timedelta(days=1),
+            current_period_end=now - timedelta(days=1),
+        )
+        repository._reservations[reservation.id] = replace(
+            reservation, expires_at=now - timedelta(minutes=1)
+        )
+
+    await runtime.run_reconcile_sweep()
+
+    refreshed_trial = await repository.get_subscription(trial.id)
+    assert refreshed_trial is not None
+    assert refreshed_trial.status is SubscriptionStatus.EXPIRED
+    refreshed_reservation = await repository.get_usage_reservation(reservation.id)
+    assert refreshed_reservation is not None
+    assert refreshed_reservation.state is UsageReservationState.RELEASED
 
 
 @pytest.mark.asyncio

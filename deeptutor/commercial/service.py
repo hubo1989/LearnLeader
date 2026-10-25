@@ -650,6 +650,10 @@ class CommercialControlPlane:
         plan = await self.repository.get_plan_version(clean_plan_id)
         if plan is None:
             raise CommercialNotFound(f"plan version not found: {clean_plan_id}")
+        if plan.price_minor <= 0:
+            raise EntitlementDenied(
+                "this plan version cannot be ordered; contact support to change plans"
+            )
         now = self._now()
         period_start = now
         if order_type is OrderType.SUBSCRIPTION_RENEW:
@@ -705,11 +709,16 @@ class CommercialControlPlane:
         operator: str,
         payment_reference: str | None = None,
     ) -> tuple[PurchaseOrder, Subscription]:
-        """Confirm payment and atomically replace effective access.
+        """Confirm payment and activate the ordered access without a gap.
 
-        The subscription is keyed to the order id (``external_subscription_id``),
-        so a retried fulfillment converges on the same row instead of stacking
-        subscriptions.
+        An early renewal of the same plan *extends* the live subscription to
+        the order's period end — replacing it immediately would cancel the
+        customer's remaining paid time, and entitlement resolution ignores
+        subscriptions whose period has not started. Every other fulfillment
+        replaces effective access through the atomic activate path, with the
+        new period starting no later than now. The replacement subscription
+        is keyed to the order id (``external_subscription_id``), so a retried
+        fulfillment converges on the same row instead of stacking rows.
         """
 
         clean_order_id = _required(order_id, "order_id")
@@ -724,6 +733,24 @@ class CommercialControlPlane:
                 f"order in status {order.status.value} cannot be fulfilled"
             )
         now = self._now()
+        if order.period_end <= now:
+            raise InvalidOrderTransition(
+                "the purchased period has already ended; create a new order"
+            )
+        live = await self.repository.get_entitled_subscription(order.customer_id, now)
+        if (
+            live is not None
+            and live.plan_version_id == order.plan_version_id
+            and order.period_start >= live.current_period_end
+        ):
+            return await self.repository.pay_and_fulfill_order(
+                order.id,
+                None,
+                now,
+                operator=clean_operator,
+                payment_reference=_optional(payment_reference),
+                extend_subscription_id=live.id,
+            )
         candidate = Subscription(
             id=self._id_factory("sub"),
             customer_id=order.customer_id,
@@ -731,7 +758,7 @@ class CommercialControlPlane:
             status=SubscriptionStatus.ACTIVE,
             provider="manual",
             external_subscription_id=order.id,
-            current_period_start=order.period_start,
+            current_period_start=min(order.period_start, now),
             current_period_end=order.period_end,
             trial_started_at=None,
             trial_ends_at=None,

@@ -717,11 +717,12 @@ class InMemoryCommercialRepository:
     async def pay_and_fulfill_order(
         self,
         order_id: str,
-        subscription_candidate: Subscription,
+        subscription_candidate: Subscription | None,
         changed_at: datetime,
         *,
         operator: str,
         payment_reference: str | None = None,
+        extend_subscription_id: str | None = None,
     ) -> tuple[PurchaseOrder, Subscription]:
         async with self._lock:
             order = self._require_order(order_id)
@@ -734,12 +735,33 @@ class InMemoryCommercialRepository:
                 raise InvalidOrderTransition(
                     f"order in status {order.status.value} cannot be fulfilled"
                 )
-            # The activation below deduplicates on the order's external
-            # subscription id, so a concurrent retry converges on one row.
-            activated = await self._activate_subscription_locked(
-                subscription_candidate,
-                changed_at,
-            )
+            if extend_subscription_id is not None:
+                # Early renewal: extend the live subscription instead of
+                # replacing it, so paid time is never interrupted.
+                live = self._subscriptions.get(extend_subscription_id)
+                if live is None or live.status not in {
+                    SubscriptionStatus.TRIALING,
+                    SubscriptionStatus.ACTIVE,
+                    SubscriptionStatus.PAST_DUE,
+                }:
+                    raise CommercialConflict("renewal target subscription is not live anymore")
+                if order.period_end <= live.current_period_end:
+                    raise CommercialConflict("renewal order does not extend the live period")
+                activated = replace(
+                    live,
+                    current_period_end=order.period_end,
+                    version=live.version + 1,
+                    updated_at=changed_at,
+                )
+                self._subscriptions[live.id] = activated
+            else:
+                assert subscription_candidate is not None
+                # The activation below deduplicates on the order's external
+                # subscription id, so a concurrent retry converges on one row.
+                activated = self._activate_subscription_locked(
+                    subscription_candidate,
+                    changed_at,
+                )
             metadata = dict(thaw_json(order.metadata) or {})
             metadata["fulfilled_by"] = operator
             if payment_reference:
@@ -756,12 +778,12 @@ class InMemoryCommercialRepository:
             self._orders[order.id] = updated
             return updated, activated
 
-    async def _activate_subscription_locked(
+    def _activate_subscription_locked(
         self,
         candidate: Subscription,
         changed_at: datetime,
     ) -> Subscription:
-        """In-lock variant of ``activate_paid_subscription`` for composition."""
+        """In-lock, in-memory variant of ``activate_paid_subscription``."""
 
         if candidate.external_subscription_id:
             key = (candidate.provider, candidate.external_subscription_id)
@@ -831,8 +853,6 @@ class InMemoryCommercialRepository:
             existing.order_type,
             existing.price_minor,
             existing.currency,
-            existing.period_start,
-            existing.period_end,
             existing.provider,
         ) == (
             candidate.customer_id,
@@ -840,8 +860,6 @@ class InMemoryCommercialRepository:
             candidate.order_type,
             candidate.price_minor,
             candidate.currency,
-            candidate.period_start,
-            candidate.period_end,
             candidate.provider,
         )
 

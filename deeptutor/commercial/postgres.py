@@ -1107,11 +1107,12 @@ class PostgresCommercialRepository:
     async def pay_and_fulfill_order(
         self,
         order_id: str,
-        subscription_candidate: Subscription,
+        subscription_candidate: Subscription | None,
         changed_at: datetime,
         *,
         operator: str,
         payment_reference: str | None = None,
+        extend_subscription_id: str | None = None,
     ) -> tuple[PurchaseOrder, Subscription]:
         async with self._connection() as connection, connection.transaction():
             order_row = await connection.fetchrow(
@@ -1133,40 +1134,64 @@ class PostgresCommercialRepository:
                 raise InvalidOrderTransition(
                     f"order in status {order.status.value} cannot be fulfilled"
                 )
-            # Same replacement semantics as activate_paid_subscription, keyed
-            # to the order id so a retried fulfillment converges on one row.
-            existing_row = await connection.fetchrow(
-                """
-                SELECT * FROM commercial.subscription
-                WHERE provider = $1 AND external_subscription_id = $2
-                """,
-                subscription_candidate.provider,
-                subscription_candidate.external_subscription_id,
-            )
-            if existing_row is not None:
-                existing = _subscription(existing_row)
-                if not _same_subscription_identity(existing, subscription_candidate):
-                    raise IdempotencyConflict(
-                        "external subscription id was reused with different semantics"
-                    )
-                subscription = existing
-            else:
-                await connection.execute(
+            if extend_subscription_id is not None:
+                # Early renewal: extend the live subscription instead of
+                # replacing it, so paid time is never interrupted.
+                extended_row = await connection.fetchrow(
                     """
                     UPDATE commercial.subscription
-                    SET status = 'canceled', canceled_at = $2,
-                        version = version + 1, updated_at = $2
-                    WHERE customer_id = $1
+                    SET current_period_end = $2, version = version + 1,
+                        updated_at = $3
+                    WHERE id = $1
                       AND status IN ('trialing', 'active', 'past_due')
+                      AND current_period_end < $2
+                    RETURNING *
                     """,
-                    order.customer_id,
+                    extend_subscription_id,
+                    order.period_end,
                     changed_at,
                 )
-                try:
-                    await self._insert_subscription(connection, subscription_candidate)
-                except Exception as exc:
-                    _raise_subscription_conflict(exc)
-                subscription = subscription_candidate
+                if extended_row is None:
+                    raise CommercialConflict(
+                        "renewal target subscription is not live or not extended"
+                    )
+                subscription = _subscription(extended_row)
+            else:
+                assert subscription_candidate is not None
+                # Same replacement semantics as activate_paid_subscription,
+                # keyed to the order id so a retried fulfillment converges.
+                existing_row = await connection.fetchrow(
+                    """
+                    SELECT * FROM commercial.subscription
+                    WHERE provider = $1 AND external_subscription_id = $2
+                    """,
+                    subscription_candidate.provider,
+                    subscription_candidate.external_subscription_id,
+                )
+                if existing_row is not None:
+                    existing = _subscription(existing_row)
+                    if not _same_subscription_identity(existing, subscription_candidate):
+                        raise IdempotencyConflict(
+                            "external subscription id was reused with different semantics"
+                        )
+                    subscription = existing
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE commercial.subscription
+                        SET status = 'canceled', canceled_at = $2,
+                            version = version + 1, updated_at = $2
+                        WHERE customer_id = $1
+                          AND status IN ('trialing', 'active', 'past_due')
+                        """,
+                        order.customer_id,
+                        changed_at,
+                    )
+                    try:
+                        await self._insert_subscription(connection, subscription_candidate)
+                    except Exception as exc:
+                        _raise_subscription_conflict(exc)
+                    subscription = subscription_candidate
             metadata = dict(thaw_json(order.metadata) or {})
             metadata["fulfilled_by"] = operator
             if payment_reference:
@@ -1246,15 +1271,10 @@ class PostgresCommercialRepository:
                 "DELETE FROM commercial.usage_reservation WHERE customer_id = $1",
                 customer_id,
             )
-            # Orders reference subscriptions deferrably; drop them first.
-            await connection.execute(
-                """
-                UPDATE commercial.purchase_order
-                SET subscription_id = NULL
-                WHERE customer_id = $1 AND subscription_id IS NOT NULL
-                """,
-                customer_id,
-            )
+            # The order→subscription FK is deferrable: deleting orders
+            # before subscriptions satisfies it at commit, and nulling
+            # subscription_id instead would violate the fulfilled-shape
+            # check (checks are NOT deferrable).
             await connection.execute(
                 "DELETE FROM commercial.purchase_order WHERE customer_id = $1",
                 customer_id,
@@ -1358,8 +1378,6 @@ def _same_order_identity(existing: PurchaseOrder, candidate: PurchaseOrder) -> b
         existing.order_type,
         existing.price_minor,
         existing.currency,
-        existing.period_start,
-        existing.period_end,
         existing.provider,
     ) == (
         candidate.customer_id,
@@ -1367,8 +1385,6 @@ def _same_order_identity(existing: PurchaseOrder, candidate: PurchaseOrder) -> b
         candidate.order_type,
         candidate.price_minor,
         candidate.currency,
-        candidate.period_start,
-        candidate.period_end,
         candidate.provider,
     )
 

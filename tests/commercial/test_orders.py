@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -164,3 +164,57 @@ async def test_unknown_order_and_plan_fail_loudly(commercial_harness):
         await service.create_order(customer.id, "planv_missing", idempotency_key="x")
     with pytest.raises(ValueError):
         await service.create_order(customer.id, plan.id, idempotency_key=" ")
+
+
+@pytest.mark.asyncio
+async def test_idempotent_replay_across_clock_advance(commercial_harness):
+    """A replay at a later clock must return the original order, not conflict."""
+    service, _repository, clock = commercial_harness
+    customer, plan = await seed_customer_and_plan(service)
+
+    first = await service.create_order(customer.id, plan.id, idempotency_key="replay-1")
+    clock.value = clock.value + timedelta(days=3)
+    replayed = await service.create_order(customer.id, plan.id, idempotency_key="replay-1")
+    assert replayed.id == first.id
+    assert replayed.period_start == first.period_start
+
+
+@pytest.mark.asyncio
+async def test_early_renewal_extends_live_subscription_without_gap(commercial_harness):
+    service, _repository, clock = commercial_harness
+    customer, plan = await seed_customer_and_plan(service)
+    live = await service.create_active_subscription(
+        customer.id,
+        plan.id,
+        external_subscription_id="sub-live-renew",
+        current_period_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        current_period_end=datetime(2026, 8, 20, tzinfo=timezone.utc),
+    )
+
+    order = await service.create_order(
+        customer.id,
+        plan.id,
+        order_type=OrderType.SUBSCRIPTION_RENEW,
+        idempotency_key="early-renew-1",
+    )
+    fulfilled, subscription = await service.pay_and_fulfill_order(order.id, operator="admin@local")
+
+    assert subscription.id == live.id  # extended, not replaced
+    assert subscription.current_period_end == order.period_end
+    assert subscription.status.value == "active"
+    assert fulfilled.subscription_id == live.id
+
+    resolved = await service.resolve_entitlements(customer.id)
+    assert resolved.active is True
+    assert resolved.subscription_id == live.id
+
+
+@pytest.mark.asyncio
+async def test_fulfilling_an_expired_period_is_rejected(commercial_harness):
+    service, _repository, clock = commercial_harness
+    customer, plan = await seed_customer_and_plan(service)
+    order = await service.create_order(customer.id, plan.id, idempotency_key="stale-1")
+    clock.value = order.period_end + timedelta(seconds=1)
+
+    with pytest.raises(InvalidOrderTransition, match="already ended"):
+        await service.pay_and_fulfill_order(order.id, operator="admin@local")

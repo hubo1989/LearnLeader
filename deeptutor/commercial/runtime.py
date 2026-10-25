@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
@@ -174,10 +173,7 @@ class CommercialRuntime:
         if control_plane is None:
             return
         try:
-            report = await control_plane.reconcile(
-                datetime.now(timezone.utc),
-                repair=True,
-            )
+            report = await control_plane.reconcile(repair=True)
         except asyncio.CancelledError:
             raise
         except Exception:

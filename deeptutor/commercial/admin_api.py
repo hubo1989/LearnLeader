@@ -13,7 +13,7 @@ behind ``require_admin`` (see ``deeptutor.api.main``).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -34,7 +34,7 @@ class PublishPlanRequest(BaseModel):
     name: str
     price_minor: int = Field(ge=0)
     currency: str
-    billing_interval: str = "month"
+    billing_interval: Literal["month", "year"] = "month"
     entitlements: dict[str, Any]
 
 
@@ -72,6 +72,7 @@ async def list_orders(
         if customer is None:
             return []
         orders = await control_plane.list_orders(customer.id, status=status_filter)
+        orders = orders[-limit:]
     else:
         orders = await control_plane.repository.list_all_orders(
             status=status_filter,
@@ -169,6 +170,16 @@ async def get_owner_usage(
 ) -> dict[str, Any]:
     """Per-user token accounting for support and risk review."""
 
+    if since is not None and since.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="since must carry a timezone offset",
+        )
+    if until is not None and until.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="until must carry a timezone offset",
+        )
     control_plane = _require_control_plane()
     customer = await control_plane.get_billing_customer_by_owner(owner_id)
     if customer is None:

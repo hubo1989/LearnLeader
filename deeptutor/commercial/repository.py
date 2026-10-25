@@ -139,11 +139,12 @@ class CommercialRepository(Protocol):
     async def pay_and_fulfill_order(
         self,
         order_id: str,
-        subscription_candidate: Subscription,
+        subscription_candidate: Subscription | None,
         changed_at: datetime,
         *,
         operator: str,
         payment_reference: str | None = None,
+        extend_subscription_id: str | None = None,
     ) -> tuple[PurchaseOrder, Subscription]: ...
 
     async def cancel_order(

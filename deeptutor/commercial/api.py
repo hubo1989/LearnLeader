@@ -291,6 +291,10 @@ async def create_commercial_order(
         )
     except CommercialNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except CommercialError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return _order_response(order)
@@ -299,10 +303,10 @@ async def create_commercial_order(
 @router.get("/commercial/orders", response_model=list[CommercialOrderResponse])
 async def list_my_commercial_orders(
     _payload: TokenPayload | None = Depends(require_commercial_access),
-    status: str | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
 ) -> list[CommercialOrderResponse]:
     control_plane, customer_id = await _require_customer_control_plane()
-    orders = await control_plane.list_orders(customer_id, status=status)
+    orders = await control_plane.list_orders(customer_id, status=status_filter)
     return [_order_response(order) for order in orders]
 
 
