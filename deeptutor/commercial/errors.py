@@ -23,6 +23,10 @@ class ImmutablePlanVersion(CommercialConflict):
     """An existing plan version was republished with different content."""
 
 
+class ImmutablePriceVersion(CommercialConflict):
+    """An existing catalog row was republished with different content."""
+
+
 class ActiveSubscriptionExists(CommercialConflict):
     """A customer already owns a trialing or active subscription."""
 

@@ -9,6 +9,7 @@ from .models import (
     BillingCustomer,
     Entitlement,
     PlanVersion,
+    PriceEntry,
     PurchaseOrder,
     ReconciliationReport,
     Subscription,
@@ -38,6 +39,21 @@ class CommercialRepository(Protocol):
     async def list_plan_versions(self) -> tuple[PlanVersion, ...]: ...
 
     async def list_entitlements(self, plan_version_id: str) -> tuple[Entitlement, ...]: ...
+
+    async def publish_price_entries(
+        self,
+        entries: tuple[PriceEntry, ...],
+    ) -> tuple[PriceEntry, ...]: ...
+
+    async def resolve_price(
+        self,
+        kind: str,
+        meter: str,
+        model_tier: str,
+        at: datetime,
+    ) -> PriceEntry | None: ...
+
+    async def list_price_entries(self) -> tuple[PriceEntry, ...]: ...
 
     async def ensure_trial(
         self,
@@ -88,6 +104,9 @@ class CommercialRepository(Protocol):
         self,
         candidate: UsageReservation,
         quota_limit: int | None,
+        *,
+        budget_limit_micros: int | None = None,
+        estimated_cost_micros: int = 0,
     ) -> UsageReservation: ...
 
     async def get_usage_reservation(

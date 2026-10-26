@@ -14,6 +14,7 @@ from .errors import (
     EntitlementDenied,
     IdempotencyConflict,
     ImmutablePlanVersion,
+    ImmutablePriceVersion,
     InvalidOrderTransition,
     InvalidSubscriptionTransition,
     PendingOrderExists,
@@ -23,10 +24,13 @@ from .errors import (
 from .keys import canonical_json
 from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
+    ESTIMATED_USAGE_MIN_EVENTS,
+    ESTIMATED_USAGE_SHARE_THRESHOLD,
     BillingCustomer,
     Entitlement,
     OrderStatus,
     PlanVersion,
+    PriceEntry,
     PurchaseOrder,
     ReconciliationFinding,
     ReconciliationReport,
@@ -36,6 +40,7 @@ from .models import (
     UsageReservation,
     UsageReservationState,
     WebhookEvent,
+    reservation_metadata_fingerprint,
     thaw_json,
 )
 
@@ -55,6 +60,8 @@ class InMemoryCommercialRepository:
         self._plans: dict[str, PlanVersion] = {}
         self._plan_by_key: dict[tuple[str, int], str] = {}
         self._entitlements: dict[str, tuple[Entitlement, ...]] = {}
+        self._prices: dict[str, PriceEntry] = {}
+        self._price_by_row: dict[tuple[str, str, str, str], str] = {}
         self._subscriptions: dict[str, Subscription] = {}
         self._subscription_by_external: dict[tuple[str, str], str] = {}
         self._webhooks: dict[str, WebhookEvent] = {}
@@ -168,6 +175,112 @@ class InMemoryCommercialRepository:
     async def list_entitlements(self, plan_version_id: str) -> tuple[Entitlement, ...]:
         async with self._lock:
             return self._entitlements.get(plan_version_id, ())
+
+    async def publish_price_entries(
+        self,
+        entries: tuple[PriceEntry, ...],
+    ) -> tuple[PriceEntry, ...]:
+        async with self._lock:
+            # Validate the whole batch before mutating any state, matching
+            # the Postgres transaction: a rejected row can never leave
+            # earlier rows of the same batch published.
+            published: list[PriceEntry] = []
+            pending: list[PriceEntry] = []
+            batch_rows: set[tuple[str, str, str, str]] = set()
+            for candidate in entries:
+                row_key = (
+                    candidate.price_version,
+                    candidate.kind,
+                    candidate.meter,
+                    candidate.model_tier,
+                )
+                if row_key in batch_rows:
+                    raise CommercialConflict(
+                        "duplicate price row in one catalog publication: "
+                        f"{candidate.meter}/{candidate.model_tier}"
+                    )
+                batch_rows.add(row_key)
+                existing_id = self._price_by_row.get(row_key)
+                if existing_id is not None:
+                    existing = self._prices[existing_id]
+                    if not _same_price_entry(existing, candidate):
+                        raise ImmutablePriceVersion(
+                            "price catalog row is immutable; publish a new price_version"
+                        )
+                    published.append(existing)
+                    continue
+                if candidate.id in self._prices:
+                    raise CommercialConflict(f"price entry id already exists: {candidate.id}")
+                published.append(candidate)
+                pending.append(candidate)
+            # Single currency per platform_cost ledger, under the same lock
+            # as the insert (mirrors the Postgres ledger-currency trigger).
+            for candidate in pending:
+                if candidate.kind != "platform_cost":
+                    continue
+                conflicting = any(
+                    entry.kind == candidate.kind and entry.currency != candidate.currency
+                    for entry in self._prices.values()
+                ) or any(
+                    entry.kind == candidate.kind
+                    and entry.currency != candidate.currency
+                    and entry is not candidate
+                    for entry in pending
+                )
+                if conflicting:
+                    raise CommercialConflict(
+                        "platform_cost catalog rows must share a single currency"
+                    )
+            for candidate in pending:
+                self._prices[candidate.id] = candidate
+                self._price_by_row[
+                    (
+                        candidate.price_version,
+                        candidate.kind,
+                        candidate.meter,
+                        candidate.model_tier,
+                    )
+                ] = candidate.id
+            return tuple(published)
+
+    async def resolve_price(
+        self,
+        kind: str,
+        meter: str,
+        model_tier: str,
+        at: datetime,
+    ) -> PriceEntry | None:
+        async with self._lock:
+            eligible = [
+                entry
+                for entry in self._prices.values()
+                if entry.kind == kind
+                and entry.meter == meter
+                and entry.model_tier == model_tier
+                and entry.effective_from <= at
+            ]
+            if not eligible:
+                return None
+            return max(
+                eligible,
+                key=lambda entry: (entry.effective_from, entry.created_at, entry.price_version),
+            )
+
+    async def list_price_entries(self) -> tuple[PriceEntry, ...]:
+        async with self._lock:
+            # Match the Postgres ORDER BY: the temporal keys descending,
+            # then kind/meter/model_tier ascending (stable two-pass sort).
+            rows = sorted(
+                self._prices.values(),
+                key=lambda entry: (entry.kind, entry.meter, entry.model_tier),
+            )
+            return tuple(
+                sorted(
+                    rows,
+                    key=lambda entry: (entry.effective_from, entry.created_at, entry.price_version),
+                    reverse=True,
+                )
+            )
 
     async def ensure_trial(
         self,
@@ -417,6 +530,9 @@ class InMemoryCommercialRepository:
         self,
         candidate: UsageReservation,
         quota_limit: int | None,
+        *,
+        budget_limit_micros: int | None = None,
+        estimated_cost_micros: int = 0,
     ) -> UsageReservation:
         async with self._lock:
             existing_id = self._reservation_by_dedupe.get(candidate.dedupe_key)
@@ -462,6 +578,33 @@ class InMemoryCommercialRepository:
                     f"quota.{candidate.meter} exceeded: limit={quota_limit}, "
                     f"used={used}, reserved={reserved}, requested={candidate.quantity}"
                 )
+            if budget_limit_micros is not None:
+                # Platform-cost budget: attributed cost from finalized
+                # events plus the snapshotted estimates of in-flight
+                # (active) reservations, so overlapping priced calls cannot
+                # each pass against the same remaining budget.
+                spent = sum(
+                    event.cost_micros
+                    for event in self._usage_events.values()
+                    if event.customer_id == candidate.customer_id
+                    and event.subscription_id == candidate.subscription_id
+                )
+                in_flight = sum(
+                    _reservation_estimate_micros(item)
+                    for item in self._reservations.values()
+                    if item.state is UsageReservationState.RESERVED
+                    and item.customer_id == candidate.customer_id
+                    and item.subscription_id == candidate.subscription_id
+                )
+                estimated = max(0, estimated_cost_micros)
+                if spent + in_flight + estimated > budget_limit_micros:
+                    raise EntitlementDenied(
+                        "budget.platform_cost exceeded: "
+                        f"limit_micros={budget_limit_micros}, "
+                        f"spent_micros={spent}, "
+                        f"in_flight_micros={in_flight}, "
+                        f"estimated_micros={estimated}"
+                    )
             self._reservations[candidate.id] = candidate
             self._reservation_by_dedupe[candidate.dedupe_key] = candidate.id
             return candidate
@@ -486,13 +629,13 @@ class InMemoryCommercialRepository:
             existing.subscription_id,
             existing.meter,
             existing.quantity,
-            canonical_json(thaw_json(existing.metadata)),
+            reservation_metadata_fingerprint(existing.metadata),
         ) != (
             candidate.customer_id,
             candidate.subscription_id,
             candidate.meter,
             candidate.quantity,
-            canonical_json(thaw_json(candidate.metadata)),
+            reservation_metadata_fingerprint(candidate.metadata),
         ):
             raise IdempotencyConflict(
                 "usage request id was replayed with different reservation semantics"
@@ -648,6 +791,32 @@ class InMemoryCommercialRepository:
                             released_at=at,
                         )
                         repaired += 1
+            totals: dict[tuple[str, str], list[int]] = {}
+            for event in self._usage_events.values():
+                key = (event.customer_id, event.subscription_id)
+                counts = totals.setdefault(key, [0, 0])
+                counts[0] += 1
+                if event.is_estimated:
+                    counts[1] += 1
+            for (customer_id, subscription_id), (total, estimated) in sorted(totals.items()):
+                if (
+                    total < ESTIMATED_USAGE_MIN_EVENTS
+                    or estimated / total <= ESTIMATED_USAGE_SHARE_THRESHOLD
+                ):
+                    continue
+                findings.append(
+                    ReconciliationFinding(
+                        code="estimated_usage_share_high",
+                        entity_type="subscription",
+                        entity_id=subscription_id,
+                        detail=(
+                            f"customer {customer_id}: {estimated}/{total} usage events "
+                            f"are estimated ({estimated / total:.0%}); provider usage "
+                            "reporting looks unhealthy"
+                        ),
+                        repairable=False,
+                    )
+                )
             return ReconciliationReport(
                 checked_at=at,
                 findings=tuple(findings),
@@ -963,6 +1132,37 @@ class InMemoryCommercialRepository:
             raise ActiveSubscriptionExists(
                 "customer already has a trialing, active, or past-due subscription"
             )
+
+
+def _reservation_estimate_micros(reservation: UsageReservation) -> int:
+    """Read a reservation's snapshotted cost estimate; 0 when unpriced."""
+
+    value = thaw_json(reservation.metadata).get("estimated_cost_micros")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _same_price_entry(existing: PriceEntry, candidate: PriceEntry) -> bool:
+    """Semantic identity for replayed catalog rows; ids and timestamps differ."""
+
+    return (
+        existing.price_version,
+        existing.kind,
+        existing.meter,
+        existing.model_tier,
+        existing.unit_price_micros,
+        existing.currency,
+        existing.effective_from,
+    ) == (
+        candidate.price_version,
+        candidate.kind,
+        candidate.meter,
+        candidate.model_tier,
+        candidate.unit_price_micros,
+        candidate.currency,
+        candidate.effective_from,
+    )
 
 
 def _same_usage_event_accounting(existing: UsageEvent, candidate: UsageEvent) -> bool:

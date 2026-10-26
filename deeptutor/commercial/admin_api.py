@@ -23,6 +23,7 @@ from deeptutor.multi_user.context import get_current_user
 
 from .api import CommercialOrderResponse, CommercialPlanResponse, _order_response
 from .errors import CommercialError, CommercialNotFound
+from .models import PriceEntryDraft
 from .runtime import get_commercial_runtime
 
 router = APIRouter()
@@ -36,6 +37,48 @@ class PublishPlanRequest(BaseModel):
     currency: str
     billing_interval: Literal["month", "year"] = "month"
     entitlements: dict[str, Any]
+
+
+class PriceEntryRequest(BaseModel):
+    """One catalog row: micros per single unit of ``meter`` for a tier."""
+
+    meter: str
+    model_tier: str = "default"
+    unit_price_micros: int = Field(ge=0)
+    currency: str
+
+
+class PublishPriceRequest(BaseModel):
+    price_version: str
+    kind: Literal["platform_cost", "list_price"]
+    effective_from: datetime
+    entries: list[PriceEntryRequest] = Field(min_length=1)
+
+
+class PriceEntryResponse(BaseModel):
+    id: str
+    price_version: str
+    kind: str
+    meter: str
+    model_tier: str
+    unit_price_micros: int
+    currency: str
+    effective_from: datetime
+    created_at: datetime
+
+
+def _price_response(entry) -> PriceEntryResponse:
+    return PriceEntryResponse(
+        id=entry.id,
+        price_version=entry.price_version,
+        kind=entry.kind,
+        meter=entry.meter,
+        model_tier=entry.model_tier,
+        unit_price_micros=entry.unit_price_micros,
+        currency=entry.currency,
+        effective_from=entry.effective_from,
+        created_at=entry.created_at,
+    )
 
 
 class MarkPaidRequest(BaseModel):
@@ -161,6 +204,64 @@ async def publish_plan(
         billing_interval=plan.billing_interval,
         trial_days=plan.trial_days,
     )
+
+
+@router.post("/admin/commercial/prices", response_model=list[PriceEntryResponse])
+async def publish_price_version(
+    request: PublishPriceRequest,
+) -> list[PriceEntryResponse]:
+    """Publish immutable price-catalog rows; identical replays are no-ops."""
+
+    control_plane = _require_control_plane()
+    try:
+        entries = await control_plane.publish_price_version(
+            price_version=request.price_version,
+            kind=request.kind,
+            effective_from=request.effective_from,
+            entries=[
+                PriceEntryDraft(
+                    meter=item.meter,
+                    model_tier=item.model_tier,
+                    unit_price_micros=item.unit_price_micros,
+                    currency=item.currency,
+                )
+                for item in request.entries
+            ],
+        )
+    except CommercialError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    log_admin_action(
+        "commercial.price.publish",
+        summary={
+            "price_version": request.price_version,
+            "kind": request.kind,
+            "effective_from": request.effective_from.isoformat(),
+            "rows": len(entries),
+        },
+    )
+    return [_price_response(entry) for entry in entries]
+
+
+@router.get("/admin/commercial/prices", response_model=list[PriceEntryResponse])
+async def list_price_entries(
+    kind: str | None = Query(default=None),
+) -> list[PriceEntryResponse]:
+    """Every published catalog row, newest effective_from first."""
+
+    control_plane = _require_control_plane()
+    try:
+        entries = await control_plane.list_price_entries(kind=kind)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    return [_price_response(entry) for entry in entries]
 
 
 @router.get("/admin/commercial/usage/{owner_id}")

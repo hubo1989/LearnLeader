@@ -19,6 +19,7 @@ from .errors import (
     EntitlementDenied,
     IdempotencyConflict,
     ImmutablePlanVersion,
+    ImmutablePriceVersion,
     InvalidOrderTransition,
     InvalidSubscriptionTransition,
     MigrationDriftError,
@@ -30,11 +31,14 @@ from .keys import canonical_json
 from .migrations import discover_migrations
 from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
+    ESTIMATED_USAGE_MIN_EVENTS,
+    ESTIMATED_USAGE_SHARE_THRESHOLD,
     BillingCustomer,
     Entitlement,
     OrderStatus,
     OrderType,
     PlanVersion,
+    PriceEntry,
     PurchaseOrder,
     ReconciliationFinding,
     ReconciliationReport,
@@ -44,6 +48,7 @@ from .models import (
     UsageReservation,
     UsageReservationState,
     WebhookEvent,
+    reservation_metadata_fingerprint,
     thaw_json,
 )
 
@@ -300,6 +305,104 @@ class PostgresCommercialRepository:
                 plan_version_id,
             )
         return tuple(_entitlement(row) for row in rows)
+
+    async def publish_price_entries(
+        self,
+        entries: tuple[PriceEntry, ...],
+    ) -> tuple[PriceEntry, ...]:
+        async with self._connection() as connection, connection.transaction():
+            published: list[PriceEntry] = []
+            for candidate in entries:
+                try:
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO commercial.price_version (
+                            id, price_version, kind, meter, model_tier,
+                            unit_price_micros, currency, effective_from, created_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        ON CONFLICT (price_version, kind, meter, model_tier) DO NOTHING
+                        RETURNING *
+                        """,
+                        candidate.id,
+                        candidate.price_version,
+                        candidate.kind,
+                        candidate.meter,
+                        candidate.model_tier,
+                        candidate.unit_price_micros,
+                        candidate.currency,
+                        candidate.effective_from,
+                        candidate.created_at,
+                    )
+                except Exception as exc:
+                    # Only a primary-key (id) collision maps to this
+                    # conflict; the row key is absorbed by ON CONFLICT, so
+                    # anything else (CHECK violation, connection failure)
+                    # propagates unchanged instead of masquerading as one.
+                    if getattr(exc, "sqlstate", None) != "23505":
+                        raise
+                    raise CommercialConflict(
+                        f"price entry id already exists: {candidate.id}"
+                    ) from exc
+                if row is not None:
+                    published.append(_price_entry(row))
+                    continue
+                existing_row = await connection.fetchrow(
+                    """
+                    SELECT * FROM commercial.price_version
+                    WHERE price_version = $1 AND kind = $2
+                      AND meter = $3 AND model_tier = $4
+                    FOR SHARE
+                    """,
+                    candidate.price_version,
+                    candidate.kind,
+                    candidate.meter,
+                    candidate.model_tier,
+                )
+                if existing_row is None:
+                    raise CommercialConflict(
+                        "price catalog insert conflicted without a visible row"
+                    )
+                existing = _price_entry(existing_row)
+                if not _same_price_entry(existing, candidate):
+                    raise ImmutablePriceVersion(
+                        "price catalog row is immutable; publish a new price_version"
+                    )
+                published.append(existing)
+            return tuple(published)
+
+    async def resolve_price(
+        self,
+        kind: str,
+        meter: str,
+        model_tier: str,
+        at: datetime,
+    ) -> PriceEntry | None:
+        async with self._connection() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT * FROM commercial.price_version
+                WHERE kind = $1 AND meter = $2 AND model_tier = $3
+                  AND effective_from <= $4
+                ORDER BY effective_from DESC, created_at DESC, price_version DESC
+                LIMIT 1
+                """,
+                kind,
+                meter,
+                model_tier,
+                at,
+            )
+        return _price_entry(row) if row is not None else None
+
+    async def list_price_entries(self) -> tuple[PriceEntry, ...]:
+        async with self._connection() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT * FROM commercial.price_version
+                ORDER BY effective_from DESC, created_at DESC,
+                         price_version DESC, kind, meter, model_tier
+                """
+            )
+        return tuple(_price_entry(row) for row in rows)
 
     async def ensure_trial(
         self,
@@ -644,6 +747,9 @@ class PostgresCommercialRepository:
         self,
         candidate: UsageReservation,
         quota_limit: int | None,
+        *,
+        budget_limit_micros: int | None = None,
+        estimated_cost_micros: int = 0,
     ) -> UsageReservation:
         async with self._connection() as connection, connection.transaction():
             existing_row = await connection.fetchrow(
@@ -761,6 +867,41 @@ class PostgresCommercialRepository:
                     f"quota.{candidate.meter} exceeded: limit={quota_limit}, "
                     f"used={consumed}, reserved={reserved}, requested={candidate.quantity}"
                 )
+            if budget_limit_micros is not None:
+                # Platform-cost budget: attributed cost from finalized
+                # events plus the snapshotted estimates of in-flight
+                # (active) reservations, so overlapping priced calls cannot
+                # each pass against the same remaining budget.  The
+                # jsonb_typeof guard keeps malformed caller-supplied values
+                # from crashing the cast; they simply count as zero.
+                spent = await connection.fetchval(
+                    """
+                    SELECT
+                        (SELECT COALESCE(SUM(cost_micros), 0)
+                         FROM commercial.usage_event
+                         WHERE customer_id = $1 AND subscription_id = $2)
+                        +
+                        (SELECT COALESCE(SUM(
+                            CASE
+                                WHEN (metadata_json->>'estimated_cost_micros') ~ '^\d+$'
+                                THEN (metadata_json->>'estimated_cost_micros')::bigint
+                                ELSE 0
+                            END), 0)
+                         FROM commercial.usage_reservation
+                         WHERE customer_id = $1 AND subscription_id = $2
+                           AND state = 'active')
+                    """,
+                    candidate.customer_id,
+                    candidate.subscription_id,
+                )
+                estimated = max(0, estimated_cost_micros)
+                if spent + estimated > budget_limit_micros:
+                    raise EntitlementDenied(
+                        "budget.platform_cost exceeded: "
+                        f"limit_micros={budget_limit_micros}, "
+                        f"spent_and_in_flight_micros={spent}, "
+                        f"estimated_micros={estimated}"
+                    )
             try:
                 row = await connection.fetchrow(
                     """
@@ -995,6 +1136,35 @@ class PostgresCommercialRepository:
                     repairable=True,
                 )
                 for row in reservation_rows
+            )
+            estimated_rows = await connection.fetch(
+                """
+                SELECT customer_id, subscription_id,
+                       COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE is_estimated) AS estimated
+                FROM commercial.usage_event
+                GROUP BY customer_id, subscription_id
+                HAVING COUNT(*) >= $1
+                   AND COUNT(*) FILTER (WHERE is_estimated)::float / COUNT(*) > $2
+                ORDER BY customer_id, subscription_id
+                """,
+                ESTIMATED_USAGE_MIN_EVENTS,
+                ESTIMATED_USAGE_SHARE_THRESHOLD,
+            )
+            findings.extend(
+                ReconciliationFinding(
+                    code="estimated_usage_share_high",
+                    entity_type="subscription",
+                    entity_id=row["subscription_id"],
+                    detail=(
+                        f"customer {row['customer_id']}: {row['estimated']}/{row['total']} "
+                        f"usage events are estimated "
+                        f"({row['estimated'] / row['total']:.0%}); provider usage "
+                        "reporting looks unhealthy"
+                    ),
+                    repairable=False,
+                )
+                for row in estimated_rows
             )
             repaired = 0
             if repair and trial_rows:
@@ -1347,6 +1517,42 @@ def _entitlement(row: Any) -> Entitlement:
     )
 
 
+def _price_entry(row: Any) -> PriceEntry:
+    return PriceEntry(
+        id=row["id"],
+        price_version=row["price_version"],
+        kind=row["kind"],
+        meter=row["meter"],
+        model_tier=row["model_tier"],
+        unit_price_micros=row["unit_price_micros"],
+        currency=row["currency"].strip(),
+        effective_from=row["effective_from"],
+        created_at=row["created_at"],
+    )
+
+
+def _same_price_entry(existing: PriceEntry, candidate: PriceEntry) -> bool:
+    """Semantic identity for replayed catalog rows; ids and timestamps differ."""
+
+    return (
+        existing.price_version,
+        existing.kind,
+        existing.meter,
+        existing.model_tier,
+        existing.unit_price_micros,
+        existing.currency,
+        existing.effective_from,
+    ) == (
+        candidate.price_version,
+        candidate.kind,
+        candidate.meter,
+        candidate.model_tier,
+        candidate.unit_price_micros,
+        candidate.currency,
+        candidate.effective_from,
+    )
+
+
 def _subscription(row: Any) -> Subscription:
     return Subscription(
         id=row["id"],
@@ -1532,13 +1738,13 @@ def _assert_same_reservation(
         existing.subscription_id,
         existing.meter,
         existing.quantity,
-        canonical_json(thaw_json(existing.metadata)),
+        reservation_metadata_fingerprint(existing.metadata),
     ) != (
         candidate.customer_id,
         candidate.subscription_id,
         candidate.meter,
         candidate.quantity,
-        canonical_json(thaw_json(candidate.metadata)),
+        reservation_metadata_fingerprint(candidate.metadata),
     ):
         raise IdempotencyConflict(
             "usage request id was replayed with different reservation semantics"

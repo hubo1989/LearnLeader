@@ -122,6 +122,51 @@ async def test_metering_reserves_and_finalizes_unpriced_usage(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_metering_finalizes_with_catalog_price(tmp_path, monkeypatch) -> None:
+    from datetime import timedelta
+
+    from deeptutor.commercial import PriceEntryDraft, metering
+
+    runtime, control_plane, customer, resolved = await _commercial_runtime()
+    await control_plane.publish_price_version(
+        price_version="prices-test",
+        kind="platform_cost",
+        effective_from=datetime.now(timezone.utc) - timedelta(days=1),
+        entries=[
+            PriceEntryDraft(
+                meter="llm_tokens",
+                model_tier="default",
+                unit_price_micros=2,
+                currency="CNY",
+            )
+        ],
+    )
+    monkeypatch.setattr(metering, "get_commercial_runtime", lambda: runtime)
+
+    with _request_context(tmp_path, resolved):
+        lease = await metering.reserve_commercial_usage(
+            meter="llm_tokens",
+            quantity=20,
+            source="platform",
+            provider="openai",
+            model="gpt-test",
+            request_id="priced-1/call-1",
+        )
+        assert lease is not None
+        await lease.finalize(
+            7,
+            usage_units={"total_tokens": 7},
+            is_estimated=False,
+        )
+
+    events = await control_plane.repository.list_usage_events(customer.id)
+    assert len(events) == 1
+    assert events[0].price_version == "prices-test"
+    assert events[0].cost_micros == 14  # 7 tokens * 2 micros
+    assert events[0].metadata["price_version"] == "unpriced-v1"  # reserve snapshot
+
+
+@pytest.mark.asyncio
 async def test_metering_bypasses_disabled_admin_and_byok(tmp_path, monkeypatch) -> None:
     from deeptutor.commercial import metering
 
