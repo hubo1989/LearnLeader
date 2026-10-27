@@ -10,10 +10,9 @@ import httpx
 
 from deeptutor.api.routers.auth import require_admin
 from deeptutor.commercial import CommercialControlPlane, InMemoryCommercialRepository
-from deeptutor.commercial.access import CommercialAccess, set_commercial_access
 from deeptutor.commercial.admin_api import router as admin_router
 from deeptutor.commercial.api import require_commercial_access, router
-from deeptutor.commercial.models import ResolvedEntitlements, SubscriptionStatus
+from deeptutor.commercial.models import SubscriptionStatus
 from deeptutor.commercial.runtime import CommercialSettings
 from deeptutor.multi_user.context import set_current_user
 from deeptutor.multi_user.models import CurrentUser, UserScope
