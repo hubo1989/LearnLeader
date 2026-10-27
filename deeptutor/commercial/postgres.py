@@ -1524,6 +1524,13 @@ class PostgresCommercialRepository:
         now: datetime,
     ) -> TurnLease | None:
         async with self._connection() as connection, connection.transaction():
+            # Serialize per-owner acquires: without the advisory lock two
+            # overlapping transactions could each count below the limit and
+            # both insert, breaching CONCURRENT_TURN_LIMIT.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"turn-lease:{candidate.owner_id}",
+            )
             await connection.execute(
                 "DELETE FROM commercial.turn_lease WHERE expires_at <= $1",
                 now,
