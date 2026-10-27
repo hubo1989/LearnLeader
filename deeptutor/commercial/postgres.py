@@ -1639,6 +1639,13 @@ class PostgresCommercialRepository:
                 "DELETE FROM commercial.purchase_order WHERE customer_id = $1",
                 customer_id,
             )
+            # Leases are keyed by owner_id, not customer_id: erase the
+            # identity-linked concurrency rows too so account deletion leaves
+            # nothing behind even for a crashed or expired lease.
+            await connection.execute(
+                "DELETE FROM commercial.turn_lease WHERE owner_id = $1",
+                owner_id,
+            )
             await connection.execute(
                 "DELETE FROM commercial.subscription WHERE customer_id = $1",
                 customer_id,

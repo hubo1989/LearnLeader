@@ -315,6 +315,18 @@ async def suspend_customer_subscription(owner_id: str) -> SubscriptionStatusResp
     """Freeze a customer's effective access while keeping their subscription."""
 
     control_plane = _require_control_plane()
+    # The returned row is post-transition; audit the state it came from.
+    customer = await control_plane.get_billing_customer_by_owner(owner_id)
+    before = None
+    if customer is not None:
+        subs = await control_plane.repository.list_subscriptions(customer.id)
+        live = [
+            item
+            for item in subs
+            if item.status.value in ("trialing", "active", "past_due", "suspended")
+        ]
+        if live:
+            before = max(live, key=lambda item: (item.updated_at, item.id)).status.value
     try:
         subscription = await control_plane.suspend_customer(owner_id)
     except CommercialNotFound as exc:
@@ -327,7 +339,8 @@ async def suspend_customer_subscription(owner_id: str) -> SubscriptionStatusResp
         summary={
             "owner_id": owner_id,
             "subscription_id": subscription.id,
-            "from_status": subscription.status.value,
+            "from_status": before,
+            "to_status": subscription.status.value,
         },
     )
     return _subscription_status_response(owner_id, subscription)

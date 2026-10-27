@@ -1039,10 +1039,13 @@ class InMemoryCommercialRepository:
         for subscription in tuple(self._subscriptions.values()):
             if subscription.customer_id != candidate.customer_id:
                 continue
+            # Suspended rows are part of the one-live invariant; a fulfilled
+            # order replaces them too, matching the PostgreSQL activation path.
             if subscription.status in {
                 SubscriptionStatus.TRIALING,
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.PAST_DUE,
+                SubscriptionStatus.SUSPENDED,
             }:
                 self._subscriptions[subscription.id] = replace(
                     subscription,
@@ -1197,6 +1200,11 @@ class InMemoryCommercialRepository:
                             (order.provider, order.external_order_id),
                             None,
                         )
+            # Leases are keyed by owner_id: erase them with the account so a
+            # crashed lease never outlives its identity.
+            for lease_key, lease in tuple(self._turn_leases.items()):
+                if lease.owner_id == owner_id:
+                    self._turn_leases.pop(lease_key, None)
             self._customers.pop(customer_id)
             self._customer_by_owner.pop(owner_id, None)
             return True

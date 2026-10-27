@@ -798,8 +798,15 @@ class CommercialControlPlane:
         plan = await self.repository.get_plan_version(subscription.plan_version_id)
         if plan is None:
             raise CommercialConflict("subscription references a missing plan version")
-        period_start = subscription.current_period_start
-        period_end = subscription.current_period_end
+        # Extended renewals share one subscription row across paid periods, so
+        # the row's current_period_* spans the whole lifetime. Use the derived
+        # billing period (fulfilled-order chain) to delimit one cycle.
+        from .billing_period import resolve_billing_period
+
+        at = self._now()
+        billing_period = await resolve_billing_period(self.repository, subscription, at)
+        period_start = billing_period.period_start
+        period_end = billing_period.period_end
         events = [
             event
             for event in await self.repository.list_usage_events(
@@ -809,7 +816,6 @@ class CommercialControlPlane:
             )
             if event.subscription_id == subscription.id
         ]
-        at = self._now()
         # Load the list_price ledger once and resolve locally: pricing each
         # overage event at its own instant would otherwise be one catalog
         # query per event on this user-facing endpoint.

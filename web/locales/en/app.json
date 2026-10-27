@@ -5585,6 +5585,8 @@
   "commercial.inactive.subscriptionRequired.description": "This feature needs an active subscription. Subscribe to continue.",
   "commercial.inactive.pastDue.title": "Payment is past due",
   "commercial.inactive.pastDue.description": "Payment for your subscription is overdue. Update your payment method to continue.",
+  "commercial.inactive.suspended.title": "Your subscription is suspended",
+  "commercial.inactive.suspended.description": "An administrator has paused this subscription. Your data is safe; contact support to resume access.",
   "commercial.inactive.canceled.title": "Subscription canceled",
   "commercial.inactive.canceled.description": "The subscription was canceled, so paid features are off.",
   "commercial.inactive.dataSafe": "Your data is still safe.",

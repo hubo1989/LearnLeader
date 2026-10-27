@@ -8,6 +8,7 @@ import type { CommercialStatus } from "./types";
 
 function inactiveCopyPrefix(status: CommercialStatus): string {
   if (status === "past_due") return "commercial.inactive.pastDue";
+  if (status === "suspended") return "commercial.inactive.suspended";
   if (status === "canceled") return "commercial.inactive.canceled";
   if (status === "trialing" || status === "expired") {
     return "commercial.inactive.trialExpired";

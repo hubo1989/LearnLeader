@@ -80,3 +80,10 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+-- 5. Billing-period resolution and budget gating look up fulfilled orders by
+--    subscription and period; without this index each budget-gated reserve
+--    and each reconcile LATERAL query scans the growing order table.
+CREATE INDEX IF NOT EXISTS purchase_order_fulfilled_period_idx
+    ON commercial.purchase_order (subscription_id, period_start, period_end)
+    WHERE status = 'fulfilled';

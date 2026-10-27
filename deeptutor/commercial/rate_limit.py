@@ -78,6 +78,54 @@ class SlidingWindowRateLimiter:
             if token_count:
                 window.tokens.append((instant, token_count))
 
+    def consume(
+        self,
+        owner_id: str,
+        *,
+        rpm_limit: int | None = None,
+        tpm_limit: int | None = None,
+        requests: int = 1,
+        tokens: int = 0,
+        now: float | None = None,
+    ) -> None:
+        """Prune, check both limits, and record — all in one critical section.
+
+        A separate check-then-record pair lets concurrent callers observe the
+        same prior usage and both pass; this atomic form is what callers that
+        enforce limits must use. ``record``/``usage`` stay for accounting-only
+        paths.
+        """
+
+        clean_owner = owner_id.strip()
+        if not clean_owner:
+            raise ValueError("owner_id is required")
+        request_count = max(0, int(requests))
+        token_count = max(0, int(tokens))
+        instant = time.monotonic() if now is None else float(now)
+        cutoff = instant - self._window_seconds
+        with self._guard:
+            window = self._windows.get(clean_owner)
+            if window is None:
+                window = _Window(requests=deque(), tokens=deque())
+                self._windows[clean_owner] = window
+            self._prune(window, cutoff)
+            if rpm_limit is not None and len(window.requests) + request_count > rpm_limit:
+                raise CommercialRateLimitDenied(
+                    f"{RISK_RATE_LIMITED}: risk.rpm exceeded: "
+                    f"limit={rpm_limit}, used={len(window.requests)}, "
+                    f"requested={request_count}"
+                )
+            token_total = sum(amount for _, amount in window.tokens)
+            if tpm_limit is not None and token_total + token_count > tpm_limit:
+                raise CommercialRateLimitDenied(
+                    f"{RISK_RATE_LIMITED}: risk.tpm exceeded: "
+                    f"limit={tpm_limit}, used={token_total}, requested={token_count}"
+                )
+            for _ in range(request_count):
+                window.requests.append(instant)
+            if token_count:
+                window.tokens.append((instant, token_count))
+
     def usage(
         self,
         owner_id: str,
@@ -157,21 +205,14 @@ def enforce_rate_limits(
     if rpm_limit is None and tpm_limit is None:
         return
     active = limiter or _default_limiter
-    request_count = max(0, int(requests))
-    token_count = max(0, int(tokens))
-    instant = time.monotonic() if now is None else float(now)
-    used_requests, used_tokens = active.usage(owner_id, now=instant)
-    if rpm_limit is not None and used_requests + request_count > rpm_limit:
-        raise CommercialRateLimitDenied(
-            f"{RISK_RATE_LIMITED}: risk.rpm exceeded: "
-            f"limit={rpm_limit}, used={used_requests}, requested={request_count}"
-        )
-    if tpm_limit is not None and used_tokens + token_count > tpm_limit:
-        raise CommercialRateLimitDenied(
-            f"{RISK_RATE_LIMITED}: risk.tpm exceeded: "
-            f"limit={tpm_limit}, used={used_tokens}, requested={token_count}"
-        )
-    active.record(owner_id, requests=request_count, tokens=token_count, now=instant)
+    active.consume(
+        owner_id,
+        rpm_limit=rpm_limit,
+        tpm_limit=tpm_limit,
+        requests=requests,
+        tokens=tokens,
+        now=now,
+    )
 
 
 __all__ = [
