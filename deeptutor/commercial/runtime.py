@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
@@ -178,13 +179,24 @@ class CommercialRuntime:
             raise
         except Exception:
             logger.exception("commercial reconcile sweep failed")
-            return
-        if report.findings:
+            report = None
+        if report is not None and report.findings:
             logger.info(
                 "commercial reconcile sweep: %d findings, %d repaired",
                 len(report.findings),
                 report.repaired,
             )
+        # Turn leases already expire lazily on acquire; sweeping here also
+        # reclaims rows from owners who stopped making turns entirely.
+        repository = self.repository
+        if repository is None:
+            return
+        try:
+            await repository.sweep_turn_leases(datetime.now(timezone.utc))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("commercial turn-lease sweep failed")
 
     async def _reconcile_janitor_loop(self) -> None:
         interval = self.settings.reconcile_interval_seconds
@@ -211,10 +223,19 @@ class CommercialRuntime:
     def trial_plan_version_id(self) -> str | None:
         return self.trial_plan.id if self.trial_plan is not None else None
 
-    async def ensure_trial_for_owner(self, owner_id: str) -> Subscription:
+    async def ensure_trial_for_owner(
+        self,
+        owner_id: str,
+        *,
+        claim_context: Mapping[str, str] | None = None,
+    ) -> Subscription:
         control_plane, trial_plan = self._require_started()
         customer = await control_plane.ensure_billing_customer(owner_id=owner_id)
-        return await control_plane.ensure_trial(customer.id, trial_plan.id)
+        return await control_plane.ensure_trial(
+            customer.id,
+            trial_plan.id,
+            claim_context=claim_context,
+        )
 
     async def resolve_for_owner(self, owner_id: str) -> ResolvedEntitlements | None:
         control_plane, _trial_plan = self._require_started()

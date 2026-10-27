@@ -5585,6 +5585,8 @@
   "commercial.inactive.subscriptionRequired.description": "此功能需要有效的订阅。开通订阅后可继续使用。",
   "commercial.inactive.pastDue.title": "订阅待支付",
   "commercial.inactive.pastDue.description": "订阅付款未完成，请更新支付方式后继续使用。",
+  "commercial.inactive.suspended.title": "您的订阅已被暂停",
+  "commercial.inactive.suspended.description": "管理员已暂停该订阅。数据仍然安全；请联系支持恢复访问。",
   "commercial.inactive.canceled.title": "订阅已取消",
   "commercial.inactive.canceled.description": "订阅已取消，付费功能已停用。",
   "commercial.inactive.dataSafe": "你的数据仍安全保存。",

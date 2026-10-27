@@ -14,7 +14,7 @@ from deeptutor.commercial.postgres import AsyncpgUnavailable, PostgresCommercial
 
 def test_initial_postgres_migration_defines_all_control_plane_tables_and_guards() -> None:
     migrations = discover_migrations()
-    assert [migration.version for migration in migrations] == [1, 2, 3]
+    assert [migration.version for migration in migrations] == [1, 2, 3, 4]
     sql = migrations[0].sql.lower()
 
     for table in (
@@ -86,6 +86,29 @@ def test_pricing_migration_defines_immutable_price_catalog() -> None:
     assert "enforce_price_ledger_currency" in sql
     assert "price_version_ledger_currency" in sql
     assert "must stay single-currency" in sql
+
+
+def test_risk_migration_defines_lease_table_and_suspended_state() -> None:
+    migrations = discover_migrations()
+    sql = migrations[3].sql.lower()
+
+    # Durable turn leases with TTL expiry.
+    assert "table if not exists commercial.turn_lease" in sql
+    assert "owner_id text not null" in sql
+    for column in ("acquired_at", "heartbeat_at", "expires_at"):
+        assert f"{column} timestamptz not null" in sql
+    assert "turn_lease_owner_idx" in sql
+    assert "turn_lease_expiry_idx" in sql
+    # Trial abuse signal: hash-only JSONB context on the billing customer.
+    assert "add column if not exists trial_claim_context jsonb" in sql
+    # SUSPENDED joins the status machine, the live-per-customer unique set,
+    # and the transition trigger (upgrade version of the 0001 function).
+    assert "'suspended'" in sql
+    assert "where status in ('trialing', 'active', 'past_due', 'suspended')" in sql
+    assert "new.status in ('past_due', 'suspended', 'canceled')" in sql
+    assert "old.status = 'suspended' and new.status in ('active', 'canceled')" in sql
+    # The protected trial claim now covers its abuse-signal context too.
+    assert "new.trial_claim_context is distinct from old.trial_claim_context" in sql
 
 
 @pytest.mark.asyncio
@@ -262,6 +285,10 @@ async def test_reserve_usage_enforces_platform_cost_budget(monkeypatch) -> None:
         async def fetchrow(self, sql, *_args):
             if "WHERE dedupe_key" in sql:
                 return None
+            if "FROM commercial.purchase_order" in sql:
+                # No fulfilled order covers the reservation instant: the
+                # budget window falls back to the subscription period.
+                return None
             if "FROM commercial.subscription" in sql:
                 return {
                     "id": "sub-1",
@@ -318,7 +345,7 @@ async def test_reserve_usage_enforces_platform_cost_budget(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_reconcile_queries_estimated_usage_share_per_subscription(monkeypatch) -> None:
-    """The estimated-share finding groups events per customer subscription."""
+    """The estimated-share finding groups events per customer billing period."""
 
     now = datetime(2026, 10, 25, 9, 0, tzinfo=timezone.utc)
 
@@ -337,20 +364,24 @@ async def test_reconcile_queries_estimated_usage_share_per_subscription(monkeypa
             return Transaction()
 
         async def fetch(self, sql, *_args):
-            if "FROM commercial.subscription" in sql:
+            if "FROM commercial.subscription" in sql and "usage_event" not in sql:
                 return []
             if "FROM commercial.usage_reservation" in sql:
                 return []
-            if "GROUP BY customer_id, subscription_id" in sql:
+            if "GROUP BY customer_id, subscription_id, billing_start, billing_end" in sql:
                 self.estimated_query = sql
                 return [
                     {
                         "customer_id": "cus-1",
                         "subscription_id": "sub-1",
+                        "billing_start": now - timedelta(days=30),
+                        "billing_end": now,
                         "total": 8,
                         "estimated": 6,
                     }
                 ]
+            if "FROM commercial.billing_customer" in sql:
+                return []
             raise AssertionError(f"unexpected fetch SQL: {sql}")
 
         async def execute(self, *_args):
@@ -371,6 +402,7 @@ async def test_reconcile_queries_estimated_usage_share_per_subscription(monkeypa
     assert len(report.findings) == 1
     finding = report.findings[0]
     assert finding.code == "estimated_usage_share_high"
-    assert finding.entity_id == "sub-1"
+    assert finding.entity_type == "billing_period"
+    assert finding.entity_id.startswith("sub-1:")
     assert finding.repairable is False
     assert "6/8" in finding.detail

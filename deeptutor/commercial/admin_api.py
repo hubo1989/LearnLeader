@@ -298,4 +298,92 @@ async def get_owner_usage(
     )
 
 
+class SubscriptionStatusResponse(BaseModel):
+    owner_id: str
+    subscription_id: str
+    status: str
+    plan_version_id: str
+    current_period_end: datetime
+    updated_at: datetime
+
+
+@router.post(
+    "/admin/commercial/customers/{owner_id}/suspend",
+    response_model=SubscriptionStatusResponse,
+)
+async def suspend_customer_subscription(owner_id: str) -> SubscriptionStatusResponse:
+    """Freeze a customer's effective access while keeping their subscription."""
+
+    control_plane = _require_control_plane()
+    # The returned row is post-transition; audit the state it came from.
+    customer = await control_plane.get_billing_customer_by_owner(owner_id)
+    before = None
+    if customer is not None:
+        subs = await control_plane.repository.list_subscriptions(customer.id)
+        live = [
+            item
+            for item in subs
+            if item.status.value in ("trialing", "active", "past_due", "suspended")
+        ]
+        if live:
+            before = max(live, key=lambda item: (item.updated_at, item.id)).status.value
+    try:
+        subscription = await control_plane.suspend_customer(owner_id)
+    except CommercialNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CommercialError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    log_admin_action(
+        "commercial.customer.suspend",
+        target_user_id=owner_id,
+        summary={
+            "owner_id": owner_id,
+            "subscription_id": subscription.id,
+            "from_status": before,
+            "to_status": subscription.status.value,
+        },
+    )
+    return _subscription_status_response(owner_id, subscription)
+
+
+@router.post(
+    "/admin/commercial/customers/{owner_id}/reinstate",
+    response_model=SubscriptionStatusResponse,
+)
+async def reinstate_customer_subscription(owner_id: str) -> SubscriptionStatusResponse:
+    """Restore a suspended customer's subscription to active access."""
+
+    control_plane = _require_control_plane()
+    try:
+        subscription = await control_plane.reinstate_customer(owner_id)
+    except CommercialNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except CommercialError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    log_admin_action(
+        "commercial.customer.reinstate",
+        target_user_id=owner_id,
+        summary={
+            "owner_id": owner_id,
+            "subscription_id": subscription.id,
+            "to_status": subscription.status.value,
+        },
+    )
+    return _subscription_status_response(owner_id, subscription)
+
+
+def _subscription_status_response(
+    owner_id: str,
+    subscription: Any,
+) -> SubscriptionStatusResponse:
+    return SubscriptionStatusResponse(
+        owner_id=owner_id,
+        subscription_id=subscription.id,
+        status=subscription.status.value,
+        plan_version_id=subscription.plan_version_id,
+        current_period_end=subscription.current_period_end,
+        updated_at=subscription.updated_at,
+    )
+
+
 __all__ = ["router"]

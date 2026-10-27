@@ -5601,6 +5601,8 @@
   "commercial.inactive.subscriptionRequired.description": "Ta funkcja wymaga aktywnej subskrypcji. Subskrybuj, aby kontynuować.",
   "commercial.inactive.pastDue.title": "Płatność zaległa",
   "commercial.inactive.pastDue.description": "Płatność za subskrypcję jest zaległa. Zaktualizuj metodę płatności.",
+  "commercial.inactive.suspended.title": "Twoja subskrypcja jest zawieszona",
+  "commercial.inactive.suspended.description": "Administrator wstrzymał tę subskrypcję. Twoje dane są bezpieczne; skontaktuj się z pomocą, aby wznowić dostęp.",
   "commercial.inactive.canceled.title": "Subskrypcja anulowana",
   "commercial.inactive.canceled.description": "Subskrypcja została anulowana, funkcje płatne są wyłączone.",
   "commercial.inactive.dataSafe": "Twoje dane są nadal bezpieczne.",

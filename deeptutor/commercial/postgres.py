@@ -33,6 +33,7 @@ from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
     ESTIMATED_USAGE_MIN_EVENTS,
     ESTIMATED_USAGE_SHARE_THRESHOLD,
+    TRIAL_ABUSE_THRESHOLD,
     BillingCustomer,
     Entitlement,
     OrderStatus,
@@ -44,6 +45,7 @@ from .models import (
     ReconciliationReport,
     Subscription,
     SubscriptionStatus,
+    TurnLease,
     UsageEvent,
     UsageReservation,
     UsageReservationState,
@@ -408,6 +410,7 @@ class PostgresCommercialRepository:
         self,
         candidate: Subscription,
         claimed_at: datetime,
+        claim_context: dict | None = None,
     ) -> Subscription:
         async with self._connection() as connection, connection.transaction():
             customer_row = await connection.fetchrow(
@@ -436,26 +439,29 @@ class PostgresCommercialRepository:
             live = await connection.fetchval(
                 """
                 SELECT id FROM commercial.subscription
-                WHERE customer_id = $1 AND status IN ('trialing', 'active', 'past_due')
+                WHERE customer_id = $1
+                  AND status IN ('trialing', 'active', 'past_due', 'suspended')
                 LIMIT 1
                 """,
                 candidate.customer_id,
             )
             if live is not None:
                 raise ActiveSubscriptionExists(
-                    "customer already has a trialing or active subscription"
+                    "customer already has a trialing, active, or suspended subscription"
                 )
             try:
                 await self._insert_subscription(connection, candidate)
                 await connection.execute(
                     """
                     UPDATE commercial.billing_customer
-                    SET trial_claimed_at = $2, trial_subscription_id = $3, updated_at = $2
+                    SET trial_claimed_at = $2, trial_subscription_id = $3,
+                        trial_claim_context = $4::jsonb, updated_at = $2
                     WHERE id = $1
                     """,
                     candidate.customer_id,
                     claimed_at,
                     candidate.id,
+                    canonical_json(thaw_json(claim_context)) if claim_context is not None else None,
                 )
             except Exception as exc:
                 _raise_subscription_conflict(exc)
@@ -533,7 +539,7 @@ class PostgresCommercialRepository:
                 SET status = 'canceled', canceled_at = $2,
                     version = version + 1, updated_at = $2
                 WHERE customer_id = $1
-                  AND status IN ('trialing', 'active', 'past_due')
+                  AND status IN ('trialing', 'active', 'past_due', 'suspended')
                 """,
                 candidate.customer_id,
                 changed_at,
@@ -871,15 +877,36 @@ class PostgresCommercialRepository:
                 # Platform-cost budget: attributed cost from finalized
                 # events plus the snapshotted estimates of in-flight
                 # (active) reservations, so overlapping priced calls cannot
-                # each pass against the same remaining budget.  The
+                # each pass against the same remaining budget.  The window
+                # is the billing period derived from the fulfilled order
+                # chain so an extended renewal restarts the budget.  The
                 # jsonb_typeof guard keeps malformed caller-supplied values
                 # from crashing the cast; they simply count as zero.
+                budget_row = await connection.fetchrow(
+                    """
+                    SELECT period_start, period_end
+                    FROM commercial.purchase_order
+                    WHERE subscription_id = $1 AND status = 'fulfilled'
+                      AND period_start <= $2 AND period_end > $2
+                    ORDER BY period_start DESC
+                    LIMIT 1
+                    """,
+                    candidate.subscription_id,
+                    candidate.created_at,
+                )
+                if budget_row is not None:
+                    budget_start = budget_row["period_start"]
+                    budget_end = budget_row["period_end"]
+                else:
+                    budget_start = subscription.current_period_start
+                    budget_end = subscription.current_period_end
                 spent = await connection.fetchval(
                     """
                     SELECT
                         (SELECT COALESCE(SUM(cost_micros), 0)
                          FROM commercial.usage_event
-                         WHERE customer_id = $1 AND subscription_id = $2)
+                         WHERE customer_id = $1 AND subscription_id = $2
+                           AND occurred_at >= $3 AND occurred_at < $4)
                         +
                         (SELECT COALESCE(SUM(
                             CASE
@@ -889,10 +916,13 @@ class PostgresCommercialRepository:
                             END), 0)
                          FROM commercial.usage_reservation
                          WHERE customer_id = $1 AND subscription_id = $2
-                           AND state = 'active')
+                           AND state = 'active'
+                           AND created_at >= $3 AND created_at < $4)
                     """,
                     candidate.customer_id,
                     candidate.subscription_id,
+                    budget_start,
+                    budget_end,
                 )
                 estimated = max(0, estimated_cost_micros)
                 if spent + estimated > budget_limit_micros:
@@ -1139,14 +1169,38 @@ class PostgresCommercialRepository:
             )
             estimated_rows = await connection.fetch(
                 """
-                SELECT customer_id, subscription_id,
+                WITH periodized AS (
+                    SELECT e.customer_id, e.subscription_id, e.is_estimated,
+                           COALESCE(
+                               o.period_start,
+                               s.current_period_start
+                           ) AS billing_start,
+                           COALESCE(
+                               o.period_end,
+                               s.current_period_end
+                           ) AS billing_end
+                    FROM commercial.usage_event e
+                    LEFT JOIN commercial.subscription s
+                        ON s.id = e.subscription_id
+                    LEFT JOIN LATERAL (
+                        SELECT po.period_start, po.period_end
+                        FROM commercial.purchase_order po
+                        WHERE po.subscription_id = e.subscription_id
+                          AND po.status = 'fulfilled'
+                          AND po.period_start <= e.occurred_at
+                          AND e.occurred_at < po.period_end
+                        ORDER BY po.period_start DESC
+                        LIMIT 1
+                    ) o ON true
+                )
+                SELECT customer_id, subscription_id, billing_start, billing_end,
                        COUNT(*) AS total,
                        COUNT(*) FILTER (WHERE is_estimated) AS estimated
-                FROM commercial.usage_event
-                GROUP BY customer_id, subscription_id
+                FROM periodized
+                GROUP BY customer_id, subscription_id, billing_start, billing_end
                 HAVING COUNT(*) >= $1
                    AND COUNT(*) FILTER (WHERE is_estimated)::float / COUNT(*) > $2
-                ORDER BY customer_id, subscription_id
+                ORDER BY customer_id, subscription_id, billing_start
                 """,
                 ESTIMATED_USAGE_MIN_EVENTS,
                 ESTIMATED_USAGE_SHARE_THRESHOLD,
@@ -1154,17 +1208,46 @@ class PostgresCommercialRepository:
             findings.extend(
                 ReconciliationFinding(
                     code="estimated_usage_share_high",
-                    entity_type="subscription",
-                    entity_id=row["subscription_id"],
+                    entity_type="billing_period",
+                    entity_id=(f"{row['subscription_id']}:{row['billing_start'].isoformat()}"),
                     detail=(
                         f"customer {row['customer_id']}: {row['estimated']}/{row['total']} "
-                        f"usage events are estimated "
+                        f"usage events in billing period "
+                        f"{row['billing_start'].isoformat()}.."
+                        f"{row['billing_end'].isoformat()} are estimated "
                         f"({row['estimated'] / row['total']:.0%}); provider usage "
                         "reporting looks unhealthy"
                     ),
                     repairable=False,
                 )
                 for row in estimated_rows
+            )
+            trial_abuse_rows = await connection.fetch(
+                """
+                SELECT trial_claim_context->>'ip_hash' AS ip_hash,
+                       COUNT(*) AS customer_count
+                FROM commercial.billing_customer
+                WHERE trial_subscription_id IS NOT NULL
+                  AND trial_claim_context ? 'ip_hash'
+                  AND length(btrim(trial_claim_context->>'ip_hash')) > 0
+                GROUP BY trial_claim_context->>'ip_hash'
+                HAVING COUNT(*) >= $1
+                ORDER BY ip_hash
+                """,
+                TRIAL_ABUSE_THRESHOLD,
+            )
+            findings.extend(
+                ReconciliationFinding(
+                    code="trial_abuse_suspected",
+                    entity_type="trial_claim",
+                    entity_id=row["ip_hash"],
+                    detail=(
+                        f"ip_hash {row['ip_hash']}: {row['customer_count']} trials "
+                        "claimed from the same visitor address"
+                    ),
+                    repairable=False,
+                )
+                for row in trial_abuse_rows
             )
             repaired = 0
             if repair and trial_rows:
@@ -1333,7 +1416,7 @@ class PostgresCommercialRepository:
                     SET current_period_end = $2, version = version + 1,
                         updated_at = $3
                     WHERE id = $1
-                      AND status IN ('trialing', 'active', 'past_due')
+                      AND status IN ('trialing', 'active', 'past_due', 'suspended')
                       AND current_period_end < $2
                     RETURNING *
                     """,
@@ -1372,7 +1455,7 @@ class PostgresCommercialRepository:
                         SET status = 'canceled', canceled_at = $2,
                             version = version + 1, updated_at = $2
                         WHERE customer_id = $1
-                          AND status IN ('trialing', 'active', 'past_due')
+                          AND status IN ('trialing', 'active', 'past_due', 'suspended')
                         """,
                         order.customer_id,
                         changed_at,
@@ -1433,6 +1516,93 @@ class PostgresCommercialRepository:
             )
             return _order(updated_row)
 
+    async def acquire_turn_lease(
+        self,
+        candidate: TurnLease,
+        *,
+        limit: int,
+        now: datetime,
+    ) -> TurnLease | None:
+        async with self._connection() as connection, connection.transaction():
+            # Serialize per-owner acquires: without the advisory lock two
+            # overlapping transactions could each count below the limit and
+            # both insert, breaching CONCURRENT_TURN_LIMIT.
+            await connection.fetchval(
+                "SELECT pg_advisory_xact_lock(hashtext($1))",
+                f"turn-lease:{candidate.owner_id}",
+            )
+            await connection.execute(
+                "DELETE FROM commercial.turn_lease WHERE expires_at <= $1",
+                now,
+            )
+            active = await connection.fetchval(
+                """
+                SELECT COUNT(*) FROM commercial.turn_lease
+                WHERE owner_id = $1 AND expires_at > $2
+                """,
+                candidate.owner_id,
+                now,
+            )
+            if active >= max(0, limit):
+                return None
+            await connection.execute(
+                """
+                INSERT INTO commercial.turn_lease (
+                    id, owner_id, capability, turn_id,
+                    acquired_at, heartbeat_at, expires_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                candidate.id,
+                candidate.owner_id,
+                candidate.capability,
+                candidate.turn_id,
+                candidate.acquired_at,
+                candidate.heartbeat_at,
+                candidate.expires_at,
+            )
+            return candidate
+
+    async def heartbeat_turn_lease(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        ttl_seconds: float,
+    ) -> TurnLease | None:
+        row = await self._connection_fetchrow(
+            """
+            UPDATE commercial.turn_lease
+            SET heartbeat_at = $2,
+                expires_at = $2 + make_interval(secs => $3::double precision)
+            WHERE id = $1 AND expires_at > $2
+            RETURNING *
+            """,
+            lease_id,
+            now,
+            float(ttl_seconds),
+        )
+        return _turn_lease(row) if row is not None else None
+
+    async def release_turn_lease(self, lease_id: str) -> bool:
+        async with self._connection() as connection:
+            result = await connection.execute(
+                "DELETE FROM commercial.turn_lease WHERE id = $1",
+                lease_id,
+            )
+        return _affected_rows(result) > 0
+
+    async def sweep_turn_leases(self, now: datetime) -> int:
+        async with self._connection() as connection:
+            result = await connection.execute(
+                "DELETE FROM commercial.turn_lease WHERE expires_at <= $1",
+                now,
+            )
+        return _affected_rows(result)
+
+    async def _connection_fetchrow(self, query: str, *args: Any) -> Any:
+        async with self._connection() as connection:
+            return await connection.fetchrow(query, *args)
+
     async def erase_customer(self, owner_id: str) -> bool:
         async with self._connection() as connection, connection.transaction():
             customer_id = await connection.fetchval(
@@ -1469,6 +1639,13 @@ class PostgresCommercialRepository:
                 "DELETE FROM commercial.purchase_order WHERE customer_id = $1",
                 customer_id,
             )
+            # Leases are keyed by owner_id, not customer_id: erase the
+            # identity-linked concurrency rows too so account deletion leaves
+            # nothing behind even for a crashed or expired lease.
+            await connection.execute(
+                "DELETE FROM commercial.turn_lease WHERE owner_id = $1",
+                owner_id,
+            )
             await connection.execute(
                 "DELETE FROM commercial.subscription WHERE customer_id = $1",
                 customer_id,
@@ -1490,6 +1667,9 @@ def _billing_customer(row: Any) -> BillingCustomer:
         trial_subscription_id=row["trial_subscription_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        trial_claim_context=_decode_json(row["trial_claim_context"])
+        if "trial_claim_context" in row.keys()
+        else None,
     )
 
 
@@ -1528,6 +1708,18 @@ def _price_entry(row: Any) -> PriceEntry:
         currency=row["currency"].strip(),
         effective_from=row["effective_from"],
         created_at=row["created_at"],
+    )
+
+
+def _turn_lease(row: Any) -> TurnLease:
+    return TurnLease(
+        id=row["id"],
+        owner_id=row["owner_id"],
+        capability=row["capability"],
+        turn_id=row["turn_id"],
+        acquired_at=row["acquired_at"],
+        heartbeat_at=row["heartbeat_at"],
+        expires_at=row["expires_at"],
     )
 
 

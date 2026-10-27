@@ -21,6 +21,7 @@ class SubscriptionStatus(str, Enum):
     TRIALING = "trialing"
     ACTIVE = "active"
     PAST_DUE = "past_due"
+    SUSPENDED = "suspended"
     CANCELED = "canceled"
     EXPIRED = "expired"
 
@@ -94,9 +95,14 @@ ALLOWED_SUBSCRIPTION_TRANSITIONS: Mapping[SubscriptionStatus, frozenset[Subscrip
         {SubscriptionStatus.EXPIRED, SubscriptionStatus.CANCELED}
     ),
     SubscriptionStatus.ACTIVE: frozenset(
-        {SubscriptionStatus.PAST_DUE, SubscriptionStatus.CANCELED}
+        {SubscriptionStatus.PAST_DUE, SubscriptionStatus.SUSPENDED, SubscriptionStatus.CANCELED}
     ),
     SubscriptionStatus.PAST_DUE: frozenset(
+        {SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELED}
+    ),
+    # Frozen access still owns the live-subscription slot; only admin
+    # reinstatement or a terminal cancel may move it.
+    SubscriptionStatus.SUSPENDED: frozenset(
         {SubscriptionStatus.ACTIVE, SubscriptionStatus.CANCELED}
     ),
     SubscriptionStatus.CANCELED: frozenset(),
@@ -145,6 +151,13 @@ class BillingCustomer:
     trial_subscription_id: str | None
     created_at: datetime
     updated_at: datetime
+    #: sha256 hashes of request-side signals captured when the trial was
+    #: claimed (``ip_hash``/``ua_hash``); never the raw values.  ``None`` for
+    #: customers whose trial predates abuse signal collection.
+    trial_claim_context: Any = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "trial_claim_context", freeze_json(self.trial_claim_context))
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +385,32 @@ class ResolvedEntitlements:
 
 
 _MISSING = object()
+
+
+@dataclass(frozen=True, slots=True)
+class TurnLease:
+    """One durable owner turn slot with heartbeat-based TTL expiry.
+
+    ``owner_id`` plus the ``capability``/``turn_id`` identity makes each
+    concurrent turn its own row, so ``CONCURRENT_TURN_LIMIT`` counts rows
+    rather than trusting a single process's memory.  A crashed replica leaves
+    its rows behind until ``expires_at`` passes; ``sweep`` removes them.
+    """
+
+    id: str
+    owner_id: str
+    capability: str | None
+    turn_id: str | None
+    acquired_at: datetime
+    heartbeat_at: datetime
+    expires_at: datetime
+
+
+#: A third lifetime trial claimed from the same visitor address is flagged.
+TRIAL_ABUSE_THRESHOLD = 3
+
+#: Durable turn-lease time-to-live; expiry frees the slot after a crash.
+TURN_LEASE_TTL_SECONDS = 900.0
 
 
 @dataclass(frozen=True, slots=True)

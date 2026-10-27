@@ -265,7 +265,7 @@ async def test_public_registration_survives_deferred_trial_provisioning(
     class Runtime:
         settings = type("Settings", (), {"enabled": True})()
 
-        async def ensure_trial_for_owner(self, _owner_id: str):
+        async def ensure_trial_for_owner(self, _owner_id: str, **_kwargs):
             raise OSError("postgres unavailable")
 
     monkeypatch.setattr(commercial_runtime, "get_commercial_runtime", lambda: Runtime())

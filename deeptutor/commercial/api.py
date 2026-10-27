@@ -39,6 +39,7 @@ class CommercialMeResponse(BaseModel):
             "trialing",
             "active",
             "past_due",
+            "suspended",
             "canceled",
             "expired",
         ]

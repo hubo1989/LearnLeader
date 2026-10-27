@@ -5585,6 +5585,8 @@
   "commercial.inactive.subscriptionRequired.description": "Diese Funktion benötigt ein aktives Abonnement. Bitte abonnieren, um fortzufahren.",
   "commercial.inactive.pastDue.title": "Zahlung überfällig",
   "commercial.inactive.pastDue.description": "Die Zahlung für dein Abonnement ist überfällig. Aktualisiere deine Zahlungsmethode.",
+  "commercial.inactive.suspended.title": "Ihr Abonnement wurde ausgesetzt",
+  "commercial.inactive.suspended.description": "Ein Administrator hat dieses Abonnement pausiert. Ihre Daten sind sicher; wenden Sie sich an den Support, um den Zugriff wiederherzustellen.",
   "commercial.inactive.canceled.title": "Abonnement gekündigt",
   "commercial.inactive.canceled.description": "Das Abonnement wurde gekündigt, daher sind die kostenpflichtigen Funktionen deaktiviert.",
   "commercial.inactive.dataSafe": "Deine Daten sind weiterhin sicher.",

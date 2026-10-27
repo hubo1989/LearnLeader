@@ -35,6 +35,12 @@ class CommercialUsageLimitExceeded(CommercialMeteringError):
     """The current subscription cannot reserve the requested quantity."""
 
 
+class CommercialUsageRateLimited(CommercialUsageLimitExceeded):
+    """The owner exhausted a risk-control RPM/TPM window (HTTP 429)."""
+
+    code = "risk_rate_limited"
+
+
 class CommercialUsageUnavailable(CommercialMeteringError):
     """The durable commercial usage ledger could not be reached safely."""
 
@@ -179,7 +185,7 @@ async def reserve_commercial_usage(
     context = _metering_context(source=source, count_byok=count_byok)
     if context is None:
         return None
-    runtime, customer_id = context
+    runtime, customer_id, access = context
     control_plane = runtime.control_plane
     if control_plane is None:
         raise CommercialUsageUnavailable("commercial usage ledger has not started")
@@ -192,6 +198,8 @@ async def reserve_commercial_usage(
         model=model,
         source=source,
         request_id=request_id,
+        owner_id=access.owner_id,
+        plan_values=access.resolved.values,
     )
     return CommercialUsageLease(
         control_plane=control_plane,
@@ -223,7 +231,7 @@ def reserve_commercial_usage_sync(
     context = _metering_context(source=source, count_byok=count_byok)
     if context is None:
         return None
-    runtime, customer_id = context
+    runtime, customer_id, access = context
 
     async def operation(control_plane: CommercialControlPlane) -> UsageReservation:
         return await _reserve(
@@ -235,6 +243,8 @@ def reserve_commercial_usage_sync(
             model=model,
             source=source,
             request_id=request_id,
+            owner_id=access.owner_id,
+            plan_values=access.resolved.values,
         )
 
     reservation = _run_control_plane_sync(runtime, operation)
@@ -295,6 +305,8 @@ async def _reserve(
     model: str | None,
     source: str,
     request_id: str | None,
+    owner_id: str | None = None,
+    plan_values: Mapping[str, Any] | None = None,
 ) -> UsageReservation:
     requested = max(1, int(quantity))
     stable_request_id = request_id or f"{meter}:{uuid.uuid4().hex}"
@@ -304,6 +316,23 @@ async def _reserve(
         "price_version": UNPRICED_PRICE_VERSION,
         "source": "byok" if source == "byok" else "platform",
     }
+    if owner_id is not None and plan_values is not None and meter == "llm_tokens":
+        # Risk gate before quota: an over-limit caller must not consume a
+        # reservation or provider capacity.  Only the LLM meter carries
+        # RPM/TPM semantics; embedding and page meters have their own quotas.
+        from .rate_limit import CommercialRateLimitDenied, enforce_rate_limits
+
+        try:
+            enforce_rate_limits(
+                plan_values,
+                owner_id=owner_id,
+                requests=1,
+                tokens=requested,
+            )
+        except CommercialRateLimitDenied as exc:
+            raise CommercialUsageRateLimited(str(exc)) from exc
+        except ValueError as exc:
+            raise CommercialUsageRateLimited(f"risk_rate_limited: {exc}") from exc
     try:
         return await control_plane.reserve_usage(
             customer_id,
@@ -320,7 +349,7 @@ def _metering_context(
     *,
     source: str,
     count_byok: bool = False,
-) -> tuple[CommercialRuntime, str] | None:
+) -> tuple[CommercialRuntime, str, Any] | None:
     try:
         runtime = get_commercial_runtime()
     except Exception as exc:
@@ -340,7 +369,7 @@ def _metering_context(
         raise CommercialUsageUnavailable("commercial access has no billing customer")
     if source == "byok" and not count_byok:
         return None
-    return runtime, customer_id
+    return runtime, customer_id, access
 
 
 T = TypeVar("T")

@@ -5601,6 +5601,8 @@
   "commercial.inactive.subscriptionRequired.description": "Ця функція потребує активної підписки. Оформіть підписку, щоб продовжити.",
   "commercial.inactive.pastDue.title": "Прострочений платіж",
   "commercial.inactive.pastDue.description": "Оплату підписки прострочено. Оновіть спосіб оплати, щоб продовжити.",
+  "commercial.inactive.suspended.title": "Вашу підписку призупинено",
+  "commercial.inactive.suspended.description": "Адміністратор призупинив цю підписку. Ваші дані в безпеці; зверніться до підтримки, щоб відновити доступ.",
   "commercial.inactive.canceled.title": "Підписку скасовано",
   "commercial.inactive.canceled.description": "Підписку скасовано, платні функції вимкнено.",
   "commercial.inactive.dataSafe": "Ваші дані в безпеці.",

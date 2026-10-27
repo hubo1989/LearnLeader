@@ -4,6 +4,7 @@ export const COMMERCIAL_STATUSES = [
   'trialing',
   'active',
   'past_due',
+  'suspended',
   'canceled',
   'expired',
 ] as const
