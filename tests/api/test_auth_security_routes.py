@@ -224,7 +224,7 @@ async def test_admin_created_user_gets_trial_or_pending_marker(local_auth_env, m
     class Runtime:
         settings = type("Settings", (), {"enabled": True})()
 
-        async def ensure_trial_for_owner(self, owner_id: str):
+        async def ensure_trial_for_owner(self, owner_id: str, **_kwargs):
             calls.append(owner_id)
 
     runtime = Runtime()
@@ -239,7 +239,7 @@ async def test_admin_created_user_gets_trial_or_pending_marker(local_auth_env, m
     assert created["trial_pending"] is False
     assert calls == [created["user_id"]]
 
-    async def fail_trial(_owner_id: str):
+    async def fail_trial(_owner_id: str, **_kwargs):
         raise OSError("postgres unavailable")
 
     runtime.ensure_trial_for_owner = fail_trial

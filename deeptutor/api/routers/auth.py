@@ -616,11 +616,30 @@ def _record_login_result(
         ) from exc
 
 
-async def _provision_commercial_trial(user_id: str, role: str) -> bool:
-    """Return whether a created regular account still needs trial repair."""
+async def _provision_commercial_trial(
+    user_id: str,
+    role: str,
+    request: Request | None = None,
+) -> bool:
+    """Return whether a created regular account still needs trial repair.
+
+    ``request`` supplies the visitor stamp for the trial's abuse-signal
+    context (sha256 hashes only); without it the claim records no context.
+    """
     if role == "admin" or not user_id:
         return False
+    claim_token = None
     try:
+        from deeptutor.commercial.entitlement_context import set_trial_claim_context
+        from deeptutor.commercial.trial_safety import build_trial_claim_context
+
+        claim = None
+        if request is not None:
+            claim = build_trial_claim_context(
+                _client_ip(request),
+                request.headers.get("user-agent"),
+            )
+        claim_token = set_trial_claim_context(claim)
         from deeptutor.commercial.runtime import get_commercial_runtime
 
         runtime = get_commercial_runtime()
@@ -634,6 +653,11 @@ async def _provision_commercial_trial(user_id: str, role: str) -> bool:
         # account when PostgreSQL becomes healthy again.
         logger.exception("Trial provisioning deferred for owner %s", user_id)
         return True
+    finally:
+        if claim_token is not None:
+            from deeptutor.commercial.entitlement_context import reset_trial_claim_context
+
+            reset_trial_claim_context(claim_token)
 
 
 async def _commercial_export_data(user_id: str) -> dict | None:
@@ -1823,7 +1847,7 @@ async def register(body: VerifyRegistrationRequest, request: Request, response: 
     username = body.email
     role = str(record.get("role") or "user")
     user_id = str(record.get("id") or "")
-    trial_pending = await _provision_commercial_trial(user_id, role)
+    trial_pending = await _provision_commercial_trial(user_id, role, request)
     token = create_token(username, role, user_id)
     response.set_cookie(value=token, max_age=_COOKIE_MAX_AGE, **_cookie_attrs())
     logger.info(
