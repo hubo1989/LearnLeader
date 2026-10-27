@@ -14,6 +14,7 @@ from .models import (
     ReconciliationReport,
     Subscription,
     SubscriptionStatus,
+    TurnLease,
     UsageEvent,
     UsageReservation,
     WebhookEvent,
@@ -59,6 +60,7 @@ class CommercialRepository(Protocol):
         self,
         candidate: Subscription,
         claimed_at: datetime,
+        claim_context: dict | None = None,
     ) -> Subscription: ...
 
     async def create_subscription(self, candidate: Subscription) -> Subscription: ...
@@ -180,5 +182,37 @@ class CommercialRepository(Protocol):
         order_id: str,
         canceled_at: datetime,
     ) -> PurchaseOrder: ...
+
+    async def acquire_turn_lease(
+        self,
+        candidate: TurnLease,
+        *,
+        limit: int,
+        now: datetime,
+    ) -> TurnLease | None:
+        """Insert one owner turn lease, or ``None`` when the limit is full.
+
+        Expired rows never count against ``limit``: callers may sweep first,
+        but the acquire itself must ignore leases past ``expires_at``.
+        """
+        ...
+
+    async def heartbeat_turn_lease(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        ttl_seconds: float,
+    ) -> TurnLease | None:
+        """Extend a live lease's TTL; ``None`` when it expired or is unknown."""
+        ...
+
+    async def release_turn_lease(self, lease_id: str) -> bool:
+        """Remove one lease; returns ``False`` when it was already gone."""
+        ...
+
+    async def sweep_turn_leases(self, now: datetime) -> int:
+        """Delete expired leases and return how many were removed."""
+        ...
 
     async def erase_customer(self, owner_id: str) -> bool: ...

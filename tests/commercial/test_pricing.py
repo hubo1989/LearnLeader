@@ -535,7 +535,9 @@ async def test_reconcile_flags_high_estimated_share_without_repair(commercial_ha
     ]
     assert len(matches) == 1
     finding = matches[0]
-    assert finding.entity_type == "subscription"
+    # M4: the share is grouped per billing period (here the trial's
+    # subscription window, since no fulfilled order exists yet).
+    assert finding.entity_type == "billing_period"
     assert finding.entity_id is not None
     assert finding.repairable is False
     assert "4/6" in finding.detail

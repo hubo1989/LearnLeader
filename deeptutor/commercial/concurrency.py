@@ -1,17 +1,24 @@
-"""Owner-scoped commercial turn concurrency for the single-process runtime.
+"""Owner-scoped commercial turn concurrency with durable lease support.
 
-The Phase-2 deployment contract runs one API process.  Every consuming entry
-point therefore shares this small in-memory lease registry.  A multi-replica
-deployment must replace it with a durable/distributed lease without changing
-the public ``concurrent_turn_limit`` rejection code.
+The Phase-2 deployment contract runs one API process, and this module's
+in-memory slot registry still serves that mode (and every test that fakes a
+runtime without a repository).  When the commercial runtime holds a live
+repository — commercial PostgreSQL mode — the slot becomes a durable
+``commercial.turn_lease`` row instead, so multi-replica deployments count the
+same owner limit across processes and a crashed replica's slots expire by
+TTL instead of leaking forever.  Either way the public rejection code stays
+``concurrent_turn_limit``.
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import logging
 import threading
 from typing import AsyncIterator
+import uuid
 
 from deeptutor.multi_user.context import get_current_user_or_none
 
@@ -21,8 +28,12 @@ from .entitlement_context import (
     require_active_commercial_access,
     require_capability,
 )
+from .models import TURN_LEASE_TTL_SECONDS, TurnLease
+from .runtime import get_commercial_runtime
 
 CONCURRENT_TURN_LIMIT = "concurrent_turn_limit"
+
+logger = logging.getLogger(__name__)
 
 
 class CommercialConcurrencyLimitDenied(RuntimeError):
@@ -38,19 +49,60 @@ _slots_guard = threading.Lock()
 _active_slots: dict[str, int] = {}
 
 
+def _durable_lease_repository():
+    """Return the runtime repository when durable leases should be used."""
+
+    try:
+        runtime = get_commercial_runtime()
+    except Exception:  # pragma: no cover - defensive: runtime construction is env-driven
+        return None
+    if not getattr(runtime.settings, "enabled", False):
+        return None
+    repository = getattr(runtime, "repository", None)
+    if repository is None:
+        # Commercial mode is on but the control plane has not finished
+        # startup; the memory fallback keeps single-process behavior.
+        return None
+    return repository
+
+
 @dataclass(slots=True)
 class CommercialTurnLease:
     """One idempotently releasable owner slot; bypass leases have no owner."""
 
     owner_id: str | None = None
+    lease_id: str | None = None
+    repository: object | None = None
+    capability: str | None = None
     _released: bool = field(default=False, init=False, repr=False)
 
     @property
     def reserved(self) -> bool:
         return self.owner_id is not None and not self._released
 
+    async def heartbeat(self, *, ttl_seconds: float = TURN_LEASE_TTL_SECONDS) -> bool:
+        """Extend a durable lease's TTL; a no-op for memory leases."""
+
+        if self.repository is None or self.lease_id is None or self._released:
+            return False
+        record = await self.repository.heartbeat_turn_lease(
+            self.lease_id,
+            now=datetime.now(timezone.utc),
+            ttl_seconds=ttl_seconds,
+        )
+        return record is not None
+
     async def release(self) -> None:
         if self.owner_id is None or self._released:
+            return
+        if self.repository is not None and self.lease_id is not None:
+            try:
+                await self.repository.release_turn_lease(self.lease_id)
+            except Exception:
+                # The lease expires by TTL even if the release write fails;
+                # never let cleanup mask the turn's own outcome.
+                logger.exception("failed to release turn lease %s", self.lease_id)
+            self._released = True
             return
         with _slots_guard:
             if self._released:
@@ -102,12 +154,34 @@ async def acquire_commercial_turn_lease(
         return CommercialTurnLease()
 
     owner_id = access.owner_id
+    repository = _durable_lease_repository()
+    if repository is not None:
+        now = datetime.now(timezone.utc)
+        record = TurnLease(
+            id=f"lease_{uuid.uuid4().hex}",
+            owner_id=owner_id,
+            capability=capability,
+            turn_id=None,
+            acquired_at=now,
+            heartbeat_at=now,
+            expires_at=now + timedelta(seconds=TURN_LEASE_TTL_SECONDS),
+        )
+        acquired = await repository.acquire_turn_lease(record, limit=limit, now=now)
+        if acquired is None:
+            raise CommercialConcurrencyLimitDenied()
+        return CommercialTurnLease(
+            owner_id=owner_id,
+            lease_id=record.id,
+            repository=repository,
+            capability=capability,
+        )
+
     with _slots_guard:
         active = _active_slots.get(owner_id, 0)
         if active >= limit:
             raise CommercialConcurrencyLimitDenied()
         _active_slots[owner_id] = active + 1
-    return CommercialTurnLease(owner_id=owner_id)
+    return CommercialTurnLease(owner_id=owner_id, capability=capability)
 
 
 @asynccontextmanager

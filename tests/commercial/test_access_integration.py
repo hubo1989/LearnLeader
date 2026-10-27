@@ -363,7 +363,7 @@ async def test_expired_trial_and_missing_subscription_install_inactive_state(
     class NoSubscriptionRuntime:
         settings = _settings()
 
-        async def ensure_trial_for_owner(self, _owner_id: str):
+        async def ensure_trial_for_owner(self, _owner_id: str, **_kwargs):
             return None
 
         async def resolve_for_owner(self, owner_id: str):
@@ -405,7 +405,7 @@ async def test_admin_bypasses_commercial_resolution(tmp_path, monkeypatch) -> No
     class ExplodingRuntime:
         settings = _settings()
 
-        async def ensure_trial_for_owner(self, _owner_id: str):
+        async def ensure_trial_for_owner(self, _owner_id: str, **_kwargs):
             raise AssertionError("admin must not enter subscription resolution")
 
     admin = _user(tmp_path, user_id="u_admin", role="admin")

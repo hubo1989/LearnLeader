@@ -43,6 +43,28 @@ _current_access: ContextVar[CommercialAccess | None] = ContextVar(
     default=None,
 )
 
+#: Request-side trial-claim signals (already hashed) for the request in
+#: flight.  The HTTP adapter installs it where the visitor address is known;
+#: entry points without that context leave it unset and claim nothing.
+_trial_claim_context: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "deeptutor_trial_claim_context",
+    default=None,
+)
+
+
+def set_trial_claim_context(
+    context: Mapping[str, Any] | None,
+) -> Token[Mapping[str, Any] | None]:
+    return _trial_claim_context.set(context)
+
+
+def reset_trial_claim_context(token: Token[Mapping[str, Any] | None]) -> None:
+    _trial_claim_context.reset(token)
+
+
+def get_trial_claim_context() -> Mapping[str, Any] | None:
+    return _trial_claim_context.get()
+
 
 def set_commercial_access(
     access: CommercialAccess | None,
@@ -62,12 +84,14 @@ async def resolve_commercial_access_for_owner(
     owner_id: str,
     *,
     runtime: CommercialRuntime | None = None,
+    claim_context: Mapping[str, Any] | None = None,
 ) -> CommercialAccess:
     """Ensure the one-time trial and resolve active or historical plan state."""
 
     current_runtime = runtime or get_commercial_runtime()
+    effective_claim = claim_context if claim_context is not None else get_trial_claim_context()
     try:
-        await current_runtime.ensure_trial_for_owner(owner_id)
+        await current_runtime.ensure_trial_for_owner(owner_id, claim_context=effective_claim)
     except (ActiveSubscriptionExists, TrialAlreadyClaimed):
         # Paid access or a historical lifetime trial is resolved below; neither
         # condition is permission to mint another trial.
@@ -367,12 +391,15 @@ __all__ = [
     "CommercialAccess",
     "CommercialAccessDenied",
     "get_commercial_access",
+    "get_trial_claim_context",
     "install_commercial_access_for_current_user",
     "integer_limit",
     "project_grant_for_commercial",
     "require_active_commercial_access",
     "require_capability",
     "reset_commercial_access",
+    "reset_trial_claim_context",
     "resolve_commercial_access_for_owner",
     "set_commercial_access",
+    "set_trial_claim_context",
 ]

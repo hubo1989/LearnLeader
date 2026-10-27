@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
+from .billing_period import billing_period_from_orders
 from .errors import (
     ActiveSubscriptionExists,
     CommercialConflict,
@@ -26,6 +27,7 @@ from .models import (
     ALLOWED_SUBSCRIPTION_TRANSITIONS,
     ESTIMATED_USAGE_MIN_EVENTS,
     ESTIMATED_USAGE_SHARE_THRESHOLD,
+    TRIAL_ABUSE_THRESHOLD,
     BillingCustomer,
     Entitlement,
     OrderStatus,
@@ -36,6 +38,7 @@ from .models import (
     ReconciliationReport,
     Subscription,
     SubscriptionStatus,
+    TurnLease,
     UsageEvent,
     UsageReservation,
     UsageReservationState,
@@ -73,6 +76,7 @@ class InMemoryCommercialRepository:
         self._orders: dict[str, PurchaseOrder] = {}
         self._order_by_dedupe: dict[str, str] = {}
         self._order_by_external: dict[tuple[str, str], str] = {}
+        self._turn_leases: dict[str, TurnLease] = {}
 
     async def ensure_billing_customer(self, candidate: BillingCustomer) -> BillingCustomer:
         async with self._lock:
@@ -286,6 +290,7 @@ class InMemoryCommercialRepository:
         self,
         candidate: Subscription,
         claimed_at: datetime,
+        claim_context: dict | None = None,
     ) -> Subscription:
         async with self._lock:
             customer = self._require_customer(candidate.customer_id)
@@ -301,10 +306,12 @@ class InMemoryCommercialRepository:
                 return previous
             self._assert_no_live_subscription(candidate.customer_id)
             self._subscriptions[candidate.id] = candidate
+            stored_context = thaw_json(claim_context) if claim_context is not None else None
             self._customers[customer.id] = replace(
                 customer,
                 trial_claimed_at=claimed_at,
                 trial_subscription_id=candidate.id,
+                trial_claim_context=stored_context,
                 updated_at=claimed_at,
             )
             return candidate
@@ -332,6 +339,7 @@ class InMemoryCommercialRepository:
                 SubscriptionStatus.TRIALING,
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.PAST_DUE,
+                SubscriptionStatus.SUSPENDED,
             }:
                 self._assert_no_live_subscription(candidate.customer_id)
             self._subscriptions[candidate.id] = candidate
@@ -367,6 +375,7 @@ class InMemoryCommercialRepository:
                     SubscriptionStatus.TRIALING,
                     SubscriptionStatus.ACTIVE,
                     SubscriptionStatus.PAST_DUE,
+                    SubscriptionStatus.SUSPENDED,
                 }:
                     self._subscriptions[subscription.id] = replace(
                         subscription,
@@ -582,12 +591,18 @@ class InMemoryCommercialRepository:
                 # Platform-cost budget: attributed cost from finalized
                 # events plus the snapshotted estimates of in-flight
                 # (active) reservations, so overlapping priced calls cannot
-                # each pass against the same remaining budget.
+                # each pass against the same remaining budget.  The window
+                # is the subscription's *billing period* (fulfilled order
+                # chain) so an extended renewal restarts the budget.
+                budget_start, budget_end = _billing_window(
+                    subscription, self._orders.values(), candidate.created_at
+                )
                 spent = sum(
                     event.cost_micros
                     for event in self._usage_events.values()
                     if event.customer_id == candidate.customer_id
                     and event.subscription_id == candidate.subscription_id
+                    and budget_start <= event.occurred_at < budget_end
                 )
                 in_flight = sum(
                     _reservation_estimate_micros(item)
@@ -595,6 +610,7 @@ class InMemoryCommercialRepository:
                     if item.state is UsageReservationState.RESERVED
                     and item.customer_id == candidate.customer_id
                     and item.subscription_id == candidate.subscription_id
+                    and budget_start <= item.created_at < budget_end
                 )
                 estimated = max(0, estimated_cost_micros)
                 if spent + in_flight + estimated > budget_limit_micros:
@@ -791,14 +807,27 @@ class InMemoryCommercialRepository:
                             released_at=at,
                         )
                         repaired += 1
-            totals: dict[tuple[str, str], list[int]] = {}
+            totals: dict[tuple[str, str, datetime, datetime], list[int]] = {}
             for event in self._usage_events.values():
-                key = (event.customer_id, event.subscription_id)
+                subscription = self._subscriptions.get(event.subscription_id)
+                if subscription is None:
+                    continue
+                period = billing_period_from_orders(
+                    subscription, tuple(self._orders.values()), event.occurred_at
+                )
+                key = (
+                    event.customer_id,
+                    event.subscription_id,
+                    period.period_start,
+                    period.period_end,
+                )
                 counts = totals.setdefault(key, [0, 0])
                 counts[0] += 1
                 if event.is_estimated:
                     counts[1] += 1
-            for (customer_id, subscription_id), (total, estimated) in sorted(totals.items()):
+            for (customer_id, subscription_id, p_start, p_end), (total, estimated) in sorted(
+                totals.items()
+            ):
                 if (
                     total < ESTIMATED_USAGE_MIN_EVENTS
                     or estimated / total <= ESTIMATED_USAGE_SHARE_THRESHOLD
@@ -807,21 +836,51 @@ class InMemoryCommercialRepository:
                 findings.append(
                     ReconciliationFinding(
                         code="estimated_usage_share_high",
-                        entity_type="subscription",
-                        entity_id=subscription_id,
+                        entity_type="billing_period",
+                        entity_id=f"{subscription_id}:{p_start.isoformat()}",
                         detail=(
                             f"customer {customer_id}: {estimated}/{total} usage events "
+                            f"in billing period {p_start.isoformat()}..{p_end.isoformat()} "
                             f"are estimated ({estimated / total:.0%}); provider usage "
                             "reporting looks unhealthy"
                         ),
                         repairable=False,
                     )
                 )
+            findings.extend(self._trial_abuse_findings())
             return ReconciliationReport(
                 checked_at=at,
                 findings=tuple(findings),
                 repaired=repaired,
             )
+
+    def _trial_abuse_findings(self) -> list[ReconciliationFinding]:
+        by_ip: dict[str, list[str]] = {}
+        for customer in self._customers.values():
+            context = thaw_json(customer.trial_claim_context)
+            if not isinstance(context, dict):
+                continue
+            ip_hash = context.get("ip_hash")
+            if not isinstance(ip_hash, str) or not ip_hash.strip():
+                continue
+            by_ip.setdefault(ip_hash.strip(), []).append(customer.id)
+        findings: list[ReconciliationFinding] = []
+        for ip_hash, customer_ids in sorted(by_ip.items()):
+            if len(customer_ids) < TRIAL_ABUSE_THRESHOLD:
+                continue
+            findings.append(
+                ReconciliationFinding(
+                    code="trial_abuse_suspected",
+                    entity_type="trial_claim",
+                    entity_id=ip_hash,
+                    detail=(
+                        f"ip_hash {ip_hash}: {len(customer_ids)} trials claimed "
+                        f"from the same visitor address"
+                    ),
+                    repairable=False,
+                )
+            )
+        return findings
 
     async def create_order(self, candidate: PurchaseOrder) -> PurchaseOrder:
         async with self._lock:
@@ -924,6 +983,7 @@ class InMemoryCommercialRepository:
                     SubscriptionStatus.TRIALING,
                     SubscriptionStatus.ACTIVE,
                     SubscriptionStatus.PAST_DUE,
+                    SubscriptionStatus.SUSPENDED,
                 }:
                     raise CommercialConflict("renewal target subscription is not live anymore")
                 if order.period_end <= live.current_period_end:
@@ -1044,6 +1104,59 @@ class InMemoryCommercialRepository:
             candidate.provider,
         )
 
+    async def acquire_turn_lease(
+        self,
+        candidate: TurnLease,
+        *,
+        limit: int,
+        now: datetime,
+    ) -> TurnLease | None:
+        async with self._lock:
+            self._expire_leases_locked(now)
+            active = sum(
+                1
+                for lease in self._turn_leases.values()
+                if lease.owner_id == candidate.owner_id and lease.expires_at > now
+            )
+            if active >= max(0, limit):
+                return None
+            self._turn_leases[candidate.id] = candidate
+            return candidate
+
+    async def heartbeat_turn_lease(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        ttl_seconds: float,
+    ) -> TurnLease | None:
+        async with self._lock:
+            lease = self._turn_leases.get(lease_id)
+            if lease is None or lease.expires_at <= now:
+                self._turn_leases.pop(lease_id, None)
+                return None
+            updated = replace(
+                lease,
+                heartbeat_at=now,
+                expires_at=now + timedelta(seconds=ttl_seconds),
+            )
+            self._turn_leases[lease_id] = updated
+            return updated
+
+    async def release_turn_lease(self, lease_id: str) -> bool:
+        async with self._lock:
+            return self._turn_leases.pop(lease_id, None) is not None
+
+    async def sweep_turn_leases(self, now: datetime) -> int:
+        async with self._lock:
+            return self._expire_leases_locked(now)
+
+    def _expire_leases_locked(self, now: datetime) -> int:
+        expired = [key for key, lease in self._turn_leases.items() if lease.expires_at <= now]
+        for key in expired:
+            del self._turn_leases[key]
+        return len(expired)
+
     async def erase_customer(self, owner_id: str) -> bool:
         async with self._lock:
             customer_id = self._customer_by_owner.get(owner_id)
@@ -1126,12 +1239,22 @@ class InMemoryCommercialRepository:
                 SubscriptionStatus.TRIALING,
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.PAST_DUE,
+                SubscriptionStatus.SUSPENDED,
             }
             for item in self._subscriptions.values()
         ):
             raise ActiveSubscriptionExists(
-                "customer already has a trialing, active, or past-due subscription"
+                "customer already has a trialing, active, past-due, or suspended subscription"
             )
+
+
+def _billing_window(
+    subscription: Subscription,
+    orders: Any,
+    at: datetime,
+) -> tuple[datetime, datetime]:
+    period = billing_period_from_orders(subscription, tuple(orders), at)
+    return period.period_start, period.period_end
 
 
 def _reservation_estimate_micros(reservation: UsageReservation) -> int:

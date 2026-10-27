@@ -247,7 +247,13 @@ class CommercialControlPlane:
             entries = tuple(entry for entry in entries if entry.kind == clean_kind)
         return entries
 
-    async def ensure_trial(self, customer_id: str, plan_version_id: str) -> Subscription:
+    async def ensure_trial(
+        self,
+        customer_id: str,
+        plan_version_id: str,
+        *,
+        claim_context: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         now = self._now()
         plan = await self.repository.get_plan_version(plan_version_id)
         if plan is None:
@@ -269,7 +275,76 @@ class CommercialControlPlane:
             created_at=now,
             updated_at=now,
         )
-        return await self.repository.ensure_trial(candidate, now)
+        clean_context = _clean_claim_context(claim_context)
+        return await self.repository.ensure_trial(candidate, now, clean_context)
+
+    async def suspend_subscription(self, subscription_id: str) -> Subscription:
+        """Freeze effective access while keeping the live subscription slot."""
+
+        return await self.transition_subscription(
+            _required(subscription_id, "subscription_id"),
+            SubscriptionStatus.SUSPENDED,
+        )
+
+    async def reinstate_subscription(self, subscription_id: str) -> Subscription:
+        """Restore a suspended subscription to active access."""
+
+        return await self.transition_subscription(
+            _required(subscription_id, "subscription_id"),
+            SubscriptionStatus.ACTIVE,
+        )
+
+    async def suspend_customer(self, owner_id: str) -> Subscription:
+        """Suspend the owner's current subscription; used by admin controls."""
+
+        customer = await self.get_billing_customer_by_owner(owner_id)
+        if customer is None:
+            raise CommercialNotFound(f"billing customer not found for owner: {owner_id}")
+        subscription = await self._live_subscription(customer.id)
+        if subscription is None:
+            raise CommercialNotFound(f"no suspendable subscription for owner: {owner_id}")
+        return await self.suspend_subscription(subscription.id)
+
+    async def reinstate_customer(self, owner_id: str) -> Subscription:
+        """Reinstate the owner's suspended subscription; used by admin controls.
+
+        Retrying after a successful reinstate is a no-op that returns the
+        already-active subscription instead of a confusing not-found.
+        """
+
+        customer = await self.get_billing_customer_by_owner(owner_id)
+        if customer is None:
+            raise CommercialNotFound(f"billing customer not found for owner: {owner_id}")
+        subscriptions = await self.repository.list_subscriptions(customer.id)
+        suspended = [item for item in subscriptions if item.status is SubscriptionStatus.SUSPENDED]
+        if suspended:
+            target = max(suspended, key=lambda item: (item.updated_at, item.created_at, item.id))
+            return await self.reinstate_subscription(target.id)
+        live = await self._live_subscription(customer.id)
+        if live is not None and live.status is SubscriptionStatus.ACTIVE:
+            return live
+        raise CommercialNotFound(f"no suspended subscription for owner: {owner_id}")
+
+    async def _live_subscription(self, customer_id: str) -> Subscription | None:
+        now = self._now()
+        live = await self.repository.get_entitled_subscription(customer_id, now)
+        if live is not None:
+            return live
+        subscriptions = await self.repository.list_subscriptions(customer_id)
+        candidates = [
+            item
+            for item in subscriptions
+            if item.status
+            in {
+                SubscriptionStatus.TRIALING,
+                SubscriptionStatus.ACTIVE,
+                SubscriptionStatus.PAST_DUE,
+                SubscriptionStatus.SUSPENDED,
+            }
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: (item.updated_at, item.created_at, item.id))
 
     async def create_active_subscription(
         self,
@@ -1235,6 +1310,27 @@ class CommercialControlPlane:
                 f"resolved subscription disappeared during reservation: {subscription_id}"
             )
         return subscription
+
+
+def _clean_claim_context(claim_context: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize trial claim signals to a hash-only JSON object.
+
+    Only ``ip_hash``/``ua_hash`` survive, and each must be a non-empty string.
+    Raw addresses or user-agent strings are never stored — callers hash them
+    with SHA-256 before they reach the control plane.
+    """
+
+    if claim_context is None:
+        return None
+    cleaned: dict[str, Any] = {}
+    for key in ("ip_hash", "ua_hash"):
+        value = claim_context.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"trial claim context {key} must be a non-empty hash string")
+        cleaned[key] = value.strip()
+    return cleaned or None
 
 
 def _resolve_model_tier(values: Mapping[str, Any], model: str | None) -> str:
